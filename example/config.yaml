@@ -1,0 +1,24 @@
+# PulseBoard CLI Example Configuration
+#
+# This config mirrors the SDK example (main.go) but uses YAML instead of code.
+#
+# Usage:
+#   Terminal 1: go run ./example/cmd/mockserver
+#   Terminal 2: go run ./cmd/pulseboard serve -c example/config.yaml
+#
+# Then open http://localhost:8080 in your browser.
+
+port: 8080
+poll_interval: 5s
+
+endpoints:
+  - name: GitHub
+    url: https://api.github.com
+
+grids:
+  - name: API
+    url_template: "http://localhost:9999/health?svc={{.svc}}&env={{.env}}"
+    dimensions:
+      svc: [users, orders]
+      env: [prod, staging]
+    extractor: json:status
