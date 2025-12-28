@@ -1,0 +1,84 @@
+# GoReleaser configuration for PulseBoard
+# Docs: https://goreleaser.com
+#
+# Usage:
+#   goreleaser release --snapshot --clean  # local test
+#   goreleaser release --clean             # actual release (needs GITHUB_TOKEN)
+
+version: 2
+
+project_name: pulseboard
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: pulseboard
+    binary: pulseboard
+    main: ./cmd/pulseboard
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    files:
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: jpalmerr
+    name: pulseboard
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"
+
+dockers:
+  - image_templates:
+      - "ghcr.io/jpalmerr/pulseboard:{{ .Version }}"
+      - "ghcr.io/jpalmerr/pulseboard:latest"
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--pull"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source=https://github.com/jpalmerr/pulseboard"
+    goos: linux
+    goarch: amd64

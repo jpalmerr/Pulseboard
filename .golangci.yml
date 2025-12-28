@@ -1,0 +1,21 @@
+# golangci-lint configuration (v2)
+# Run locally: golangci-lint run
+# Auto-fix:    golangci-lint run --fix
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+formatters:
+  enable:
+    - gofmt
