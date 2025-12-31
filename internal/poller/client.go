@@ -87,7 +87,6 @@ func (c *Client) Fetch(ctx context.Context, method, url string, headers map[stri
 
 	start := time.Now()
 
-	// default to GET if method is empty
 	if method == "" {
 		method = http.MethodGet
 	}
@@ -113,7 +112,6 @@ func (c *Client) Fetch(ctx context.Context, method, url string, headers map[stri
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// read body with size limit
 	limitedReader := io.LimitReader(resp.Body, maxResponseBodySize)
 	body, err := io.ReadAll(limitedReader)
 	if err != nil {

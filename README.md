@@ -107,4 +107,4 @@ Open http://localhost:8080 to see mock services cycling through status changes.
 
 ## License
 
-TBD
+Contact me, [James Palmer](www.linkedin.com/in/james-palmer-60f1) if you're interested in using Pulseboard. I'd be happy to open source.

@@ -31,25 +31,21 @@ import (
 //	)
 //	// Returns 2 endpoints, usable with WithEndpoints(endpoints...)
 func NewEndpointGrid(baseName string, opts ...GridOption) ([]Endpoint, error) {
-	// validate base name
 	if strings.TrimSpace(baseName) == "" {
 		return nil, errors.New("base name cannot be empty")
 	}
 
-	// initialise config with empty maps
 	cfg := &gridConfig{
 		staticLabels: make(map[string]string),
 		headers:      make(map[string]string),
 	}
 
-	// apply options
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
 			return nil, err
 		}
 	}
 
-	// validate required fields
 	if cfg.urlTemplate == "" {
 		return nil, errors.New("URL template required")
 	}
@@ -63,13 +59,11 @@ func NewEndpointGrid(baseName string, opts ...GridOption) ([]Endpoint, error) {
 		return nil, fmt.Errorf("invalid URL template: %w", err)
 	}
 
-	// generate combinations
 	combinations := cartesianProduct(cfg.dimensions)
 	if len(combinations) == 0 {
 		return nil, nil
 	}
 
-	// create endpoints
 	endpoints := make([]Endpoint, 0, len(combinations))
 	for _, combo := range combinations {
 		// URL-encode values for template, keep original for labels
@@ -82,10 +76,9 @@ func NewEndpointGrid(baseName string, opts ...GridOption) ([]Endpoint, error) {
 
 		name := formatEndpointName(baseName, combo)
 
-		// merge labels: dimension first, static overrides
+		// dimension labels first, static labels override on collision
 		labels := mergeMaps(combo, cfg.staticLabels)
 
-		// build endpoint options
 		epOpts := []EndpointOption{
 			WithLabels(flattenMap(labels)...),
 		}
@@ -128,39 +121,33 @@ func cartesianProduct(dims map[string][]string) []map[string]string {
 		return nil
 	}
 
-	// sort keys for deterministic iteration
 	keys := make([]string, 0, len(dims))
 	for k := range dims {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	// defensive check for empty dimensions (also validated in WithDimensions)
 	for _, k := range keys {
 		if len(dims[k]) == 0 {
 			return nil
 		}
 	}
 
-	// calculate total combinations
 	total := 1
 	for _, k := range keys {
 		total *= len(dims[k])
 	}
 
 	result := make([]map[string]string, 0, total)
-
-	// cartesian product
 	indices := make([]int, len(keys))
 	for {
-		// combo is like our position in grid
 		combo := make(map[string]string, len(keys))
 		for i, k := range keys {
 			combo[k] = dims[k][indices[i]]
 		}
 		result = append(result, combo)
 
-		// increment indices (rightmost first)
+		// increment indices rightmost-first, like an odometer
 		for i := len(keys) - 1; i >= 0; i-- {
 			indices[i]++
 			if indices[i] < len(dims[keys[i]]) {

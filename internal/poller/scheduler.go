@@ -198,8 +198,6 @@ func (s *Scheduler) Start(ctx context.Context) {
 		return
 	}
 	s.started = true
-
-	// initialize per-endpoint tracking
 	s.lastPolledAt = make(map[string]time.Time, len(s.endpoints))
 	s.baseInterval = s.calculateBaseInterval()
 
@@ -215,7 +213,6 @@ func (s *Scheduler) Start(ctx context.Context) {
 		defer s.wg.Done()
 		defer s.closeOnce.Do(func() { close(s.results) })
 
-		// poll all endpoints immediately on start
 		s.pollDueEndpoints(pollCtx, true)
 
 		ticker := time.NewTicker(s.baseInterval)
@@ -304,7 +301,6 @@ func (s *Scheduler) pollDueEndpoints(ctx context.Context, immediate bool) {
 func (s *Scheduler) pollEndpoints(ctx context.Context, endpoints []EndpointInfo) {
 	jobs := make(chan EndpointInfo, len(endpoints))
 
-	// spawn workers
 	var wg sync.WaitGroup
 	for i := 0; i < s.maxConcurrency; i++ {
 		wg.Add(1)
@@ -321,7 +317,6 @@ func (s *Scheduler) pollEndpoints(ctx context.Context, endpoints []EndpointInfo)
 		}()
 	}
 
-	// send jobs
 	for _, ep := range endpoints {
 		select {
 		case jobs <- ep:
@@ -351,7 +346,6 @@ func (s *Scheduler) pollEndpoint(ctx context.Context, ep EndpointInfo) StatusRes
 		Error:        resp.Error,
 	}
 
-	// determine status
 	if resp.Error != nil {
 		result.Status = "down"
 	} else if ep.Extractor != nil {

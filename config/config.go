@@ -193,7 +193,6 @@ func (e *ExtractorConfig) UnmarshalYAML(node *yaml.Node) error {
 		return e.parseShorthand(s)
 	}
 
-	// otherwise expect structured object
 	if node.Kind == yaml.MappingNode {
 		// temporary struct to avoid infinite recursion
 		var raw struct {
@@ -223,10 +222,9 @@ func (e *ExtractorConfig) UnmarshalYAML(node *yaml.Node) error {
 func (e *ExtractorConfig) parseShorthand(s string) error {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return nil // empty means use default
+		return nil
 	}
 
-	// check for type:value format
 	if idx := strings.Index(s, ":"); idx != -1 {
 		e.Type = s[:idx]
 		value := s[idx+1:]
@@ -242,7 +240,6 @@ func (e *ExtractorConfig) parseShorthand(s string) error {
 		return nil
 	}
 
-	// simple type without value
 	switch s {
 	case "default", "http":
 		e.Type = s
@@ -321,7 +318,6 @@ func Parse(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 
-	// apply defaults
 	if cfg.Port == 0 {
 		cfg.Port = 8080
 	}
@@ -329,7 +325,6 @@ func Parse(data []byte) (*Config, error) {
 		cfg.PollInterval = Duration(15 * time.Second)
 	}
 
-	// expand environment variables and validate
 	if err := cfg.expandAndValidate(); err != nil {
 		return nil, err
 	}
@@ -339,12 +334,10 @@ func Parse(data []byte) (*Config, error) {
 
 // expandAndValidate expands environment variables and validates the config.
 func (c *Config) expandAndValidate() error {
-	// validate poll interval (defaults already applied, so 0 → 15s)
 	if c.PollInterval.Duration() < minPollInterval {
 		return fmt.Errorf("poll_interval must be at least %s, got %s", minPollInterval, c.PollInterval.Duration())
 	}
 
-	// expand and validate endpoints
 	for i := range c.Endpoints {
 		ep := &c.Endpoints[i]
 
@@ -352,7 +345,6 @@ func (c *Config) expandAndValidate() error {
 			return fmt.Errorf("endpoints[%d]: name is required", i)
 		}
 
-		// expand URL
 		if ep.URL == "" {
 			return fmt.Errorf("endpoints[%d] (%s): url is required", i, ep.Name)
 		}
@@ -362,7 +354,6 @@ func (c *Config) expandAndValidate() error {
 		}
 		ep.URL = expanded
 
-		// validate URL scheme
 		parsedURL, err := url.Parse(ep.URL)
 		if err != nil {
 			return fmt.Errorf("endpoints[%d] (%s): invalid url: %w", i, ep.Name, err)
@@ -374,7 +365,6 @@ func (c *Config) expandAndValidate() error {
 			return fmt.Errorf("endpoints[%d] (%s): url scheme must be http or https, got %q", i, ep.Name, parsedURL.Scheme)
 		}
 
-		// expand headers
 		for k, v := range ep.Headers {
 			expanded, err := expandEnvVars(v)
 			if err != nil {
@@ -383,12 +373,10 @@ func (c *Config) expandAndValidate() error {
 			ep.Headers[k] = expanded
 		}
 
-		// validate method
 		if ep.Method != "" && ep.Method != "GET" && ep.Method != "HEAD" && ep.Method != "POST" {
 			return fmt.Errorf("endpoints[%d] (%s): method must be GET, HEAD, or POST", i, ep.Name)
 		}
 
-		// validate timeout
 		if ep.Timeout != 0 {
 			if ep.Timeout.Duration() < 0 {
 				return fmt.Errorf("endpoints[%d] (%s): timeout cannot be negative, got %s",
@@ -400,7 +388,6 @@ func (c *Config) expandAndValidate() error {
 			}
 		}
 
-		// validate interval
 		if ep.Interval != 0 {
 			if ep.Interval.Duration() < time.Second {
 				return fmt.Errorf("endpoints[%d] (%s): interval must be at least 1s, got %s",
@@ -412,13 +399,11 @@ func (c *Config) expandAndValidate() error {
 			}
 		}
 
-		// validate extractor
 		if err := validateExtractor(&ep.Extractor, fmt.Sprintf("endpoints[%d] (%s)", i, ep.Name)); err != nil {
 			return err
 		}
 	}
 
-	// expand and validate grids
 	for i := range c.Grids {
 		g := &c.Grids[i]
 
@@ -426,7 +411,6 @@ func (c *Config) expandAndValidate() error {
 			return fmt.Errorf("grids[%d]: name is required", i)
 		}
 
-		// expand URL template
 		if g.URLTemplate == "" {
 			return fmt.Errorf("grids[%d] (%s): url_template is required", i, g.Name)
 		}
@@ -436,12 +420,11 @@ func (c *Config) expandAndValidate() error {
 		}
 		g.URLTemplate = expanded
 
-		// validate template syntax (fail fast before SDK tries to use it)
+		// fail fast before SDK tries to use invalid template
 		if _, err := template.New("").Parse(g.URLTemplate); err != nil {
 			return fmt.Errorf("grids[%d] (%s): invalid url_template: %w", i, g.Name, err)
 		}
 
-		// validate dimensions
 		if len(g.Dimensions) == 0 {
 			return fmt.Errorf("grids[%d] (%s): at least one dimension is required", i, g.Name)
 		}
@@ -449,7 +432,6 @@ func (c *Config) expandAndValidate() error {
 			if len(dimValues) == 0 {
 				return fmt.Errorf("grids[%d] (%s): dimension %q has no values", i, g.Name, dimName)
 			}
-			// check for duplicate values within this dimension
 			seen := make(map[string]struct{}, len(dimValues))
 			for _, v := range dimValues {
 				if _, exists := seen[v]; exists {
@@ -459,7 +441,6 @@ func (c *Config) expandAndValidate() error {
 			}
 		}
 
-		// expand headers
 		for k, v := range g.Headers {
 			expanded, err := expandEnvVars(v)
 			if err != nil {
@@ -468,12 +449,10 @@ func (c *Config) expandAndValidate() error {
 			g.Headers[k] = expanded
 		}
 
-		// validate method
 		if g.Method != "" && g.Method != "GET" && g.Method != "HEAD" && g.Method != "POST" {
 			return fmt.Errorf("grids[%d] (%s): method must be GET, HEAD, or POST", i, g.Name)
 		}
 
-		// validate timeout
 		if g.Timeout != 0 {
 			if g.Timeout.Duration() < 0 {
 				return fmt.Errorf("grids[%d] (%s): timeout cannot be negative, got %s",
@@ -485,7 +464,6 @@ func (c *Config) expandAndValidate() error {
 			}
 		}
 
-		// validate interval
 		if g.Interval != 0 {
 			if g.Interval.Duration() < time.Second {
 				return fmt.Errorf("grids[%d] (%s): interval must be at least 1s, got %s",
@@ -497,13 +475,11 @@ func (c *Config) expandAndValidate() error {
 			}
 		}
 
-		// validate extractor
 		if err := validateExtractor(&g.Extractor, fmt.Sprintf("grids[%d] (%s)", i, g.Name)); err != nil {
 			return err
 		}
 	}
 
-	// ensure at least one endpoint or grid is defined
 	if len(c.Endpoints) == 0 && len(c.Grids) == 0 {
 		return errors.New("at least one endpoint or grid must be defined")
 	}

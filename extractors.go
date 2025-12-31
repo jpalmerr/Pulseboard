@@ -78,7 +78,6 @@ func extractJSONPath(data interface{}, parts []string) string {
 		}
 	}
 
-	// convert final value to string
 	switch v := current.(type) {
 	case string:
 		return v

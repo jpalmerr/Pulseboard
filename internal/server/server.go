@@ -75,14 +75,9 @@ func NewServer(st store.Store, port int, assets fs.FS, title string, logger *slo
 // Returns an error if the server fails to bind to the configured port.
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
-
-	// API routes
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/sse", s.handleSSE)
-
-	// serve dashboard assets
 	if s.assets != nil {
-		// serve index.html at root
 		mux.HandleFunc("/", s.handleDashboard)
 	}
 
@@ -109,7 +104,6 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
-	// shutdown on context cancellation
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -134,7 +128,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// read index.html from embedded assets
 	content, err := fs.ReadFile(s.assets, "assets/index.html")
 	if err != nil {
 		http.Error(w, "Dashboard not found", http.StatusInternalServerError)
@@ -184,11 +177,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ResponseController provides deadline-aware write and flush operations.
-	// This is the Go 1.20+ idiomatic way to handle write timeouts.
 	rc := http.NewResponseController(w)
-
-	// track if write deadlines are supported (may not be for some ResponseWriter impls)
 	deadlinesSupported := true
 
 	// writeAndFlush writes SSE data with a deadline to prevent blocking forever.
@@ -211,17 +200,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return rc.Flush()
 	}
 
-	// set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// subscribe to store updates
 	ch := s.store.Subscribe()
 	defer s.store.Unsubscribe(ch)
 
-	// send initial statuses (also protected by write deadline)
 	for _, status := range s.store.GetAll() {
 		data, err := json.Marshal(status)
 		if err != nil {
@@ -232,7 +218,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// stream updates
 	for {
 		select {
 		case result, ok := <-ch:

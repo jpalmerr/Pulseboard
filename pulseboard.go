@@ -139,18 +139,12 @@ func (pb *PulseBoard) Start(ctx context.Context) error {
 	pb.logger.Info("polling configured", "interval", pb.pollingInterval.String())
 	pb.logger.Info("dashboard available", "url", fmt.Sprintf("http://localhost:%d", pb.port))
 
-	// check if context already cancelled
 	if ctx.Err() != nil {
 		return nil
 	}
 
-	// convert endpoints to poller format
 	pollerEndpoints := pb.toPollerEndpoints()
-
-	// create the store
 	statusStore := store.NewMemoryStore()
-
-	// start the polling scheduler
 	scheduler := poller.NewScheduler(pollerEndpoints, pb.pollingInterval, pb.maxConcurrency, pb.logger)
 	scheduler.Start(ctx)
 
@@ -164,7 +158,6 @@ func (pb *PulseBoard) Start(ctx context.Context) error {
 			storeResult := pollerResultToStoreResult(result)
 			statusStore.Update(storeResult)
 
-			// invoke status callbacks (after store update)
 			if len(pb.statusCallbacks) > 0 {
 				publicResult := pollerResultToPublicResult(result)
 				for _, cb := range pb.statusCallbacks {
@@ -193,7 +186,6 @@ func (pb *PulseBoard) Start(ctx context.Context) error {
 		wg.Wait()        // wait for all results to be processed
 	}
 
-	// start the HTTP server
 	httpServer := server.NewServer(statusStore, pb.port, dashboard.Assets, pb.title, pb.logger)
 	if err := httpServer.Start(ctx); err != nil {
 		cleanup()
