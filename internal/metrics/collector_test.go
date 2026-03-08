@@ -330,10 +330,10 @@ func TestRecordPoll_Concurrent_NoDataRace(t *testing.T) {
 
 func TestSplitKey_ValidKey(t *testing.T) {
 	tests := []struct {
-		key        string
-		wantName   string
-		wantFrom   string
-		wantTo     string
+		key      string
+		wantName string
+		wantFrom string
+		wantTo   string
 	}{
 		{"api\x00up\x00down", "api", "up", "down"},
 		{"my-service\x00\x00up", "my-service", "", "up"}, // first poll (from = "")

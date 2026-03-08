@@ -26,11 +26,11 @@ type Collector struct {
 	buckets   []float64 // histogram upper bounds, immutable after New
 
 	// per-endpoint atomics — map keys are fixed at construction
-	pollTotal    map[string]*atomic.Int64    // name -> total polls
-	errorTotal   map[string]*atomic.Int64    // name -> polls with error
-	bucketCounts map[string][]*atomic.Int64  // name -> [len(buckets)+1] (last = +Inf)
-	latencySum   map[string]*atomic.Int64    // name -> sum in microseconds
-	latencyCount map[string]*atomic.Int64    // name -> total observations
+	pollTotal    map[string]*atomic.Int64   // name -> total polls
+	errorTotal   map[string]*atomic.Int64   // name -> polls with error
+	bucketCounts map[string][]*atomic.Int64 // name -> [len(buckets)+1] (last = +Inf)
+	latencySum   map[string]*atomic.Int64   // name -> sum in microseconds
+	latencyCount map[string]*atomic.Int64   // name -> total observations
 
 	// current status per endpoint (atomic.Value storing string)
 	currentStatus sync.Map // string(name) -> string(status)

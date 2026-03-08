@@ -281,7 +281,7 @@ func TestMarkStale_marksOldEntriesStale(t *testing.T) {
 
 	threshold := 1 * time.Minute
 	old := time.Now().Add(-2 * time.Minute) // beyond threshold
-	fresh := time.Now()                      // within threshold
+	fresh := time.Now()                     // within threshold
 
 	s.Update(types.StatusResult{EndpointName: "old-api", Status: "up", CheckedAt: old})
 	s.Update(types.StatusResult{EndpointName: "fresh-api", Status: "up", CheckedAt: fresh})

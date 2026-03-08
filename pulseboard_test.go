@@ -3,7 +3,6 @@ package pulseboard
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -220,11 +219,11 @@ func TestPulseBoard_staleThresholdZeroDisablesChecker(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// query /api/status — no entry should be stale
-	resp, err := http.Get(fmt.Sprintf("http://localhost:19200/api/status"))
+	resp, err := http.Get("http://localhost:19200/api/status")
 	if err != nil {
 		t.Fatalf("GET /api/status error = %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var results []map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {

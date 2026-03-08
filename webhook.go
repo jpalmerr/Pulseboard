@@ -76,7 +76,7 @@ func WebhookNotifier(url string, opts ...WebhookOption) func(StatusChange) {
 				"endpoint", change.EndpointName, "url", url, "error", err)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			slog.Default().Warn("webhook: server returned non-2xx",

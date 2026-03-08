@@ -97,9 +97,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// apply server TLS options
-	for _, opt := range config.BuildServerTLSOptions(cfg) {
-		opts = append(opts, opt)
-	}
+	opts = append(opts, config.BuildServerTLSOptions(cfg)...)
 
 	// apply client TLS options
 	clientTLSOpts, err := config.BuildClientTLSOptions(cfg)

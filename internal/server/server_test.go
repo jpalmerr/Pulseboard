@@ -1297,8 +1297,8 @@ func newFailingResponseWriter() *failingResponseWriter {
 	return &failingResponseWriter{header: http.Header{}}
 }
 
-func (f *failingResponseWriter) Header() http.Header     { return f.header }
-func (f *failingResponseWriter) WriteHeader(code int)    { f.code = code }
+func (f *failingResponseWriter) Header() http.Header  { return f.header }
+func (f *failingResponseWriter) WriteHeader(code int) { f.code = code }
 func (f *failingResponseWriter) Write([]byte) (int, error) {
 	return 0, fmt.Errorf("forced write error")
 }
@@ -1307,8 +1307,8 @@ func (f *failingResponseWriter) Write([]byte) (int, error) {
 // Used to exercise the dashboard ReadFile error branch.
 type errorReadFileFS struct{}
 
-func (e *errorReadFileFS) Open(string) (fs.File, error)       { return nil, fs.ErrNotExist }
-func (e *errorReadFileFS) ReadFile(string) ([]byte, error)    { return nil, fmt.Errorf("read error") }
+func (e *errorReadFileFS) Open(string) (fs.File, error)    { return nil, fs.ErrNotExist }
+func (e *errorReadFileFS) ReadFile(string) ([]byte, error) { return nil, fmt.Errorf("read error") }
 
 func TestHandleStatus_MethodNotAllowed(t *testing.T) {
 	ms := newMockStore()

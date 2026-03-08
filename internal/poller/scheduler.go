@@ -94,7 +94,7 @@ func (h *pollEntryHeap) Pop() any {
 	old := *h
 	n := len(old)
 	entry := old[n-1]
-	old[n-1] = nil  // prevent memory leak
+	old[n-1] = nil   // prevent memory leak
 	entry.index = -1 // mark as removed
 	*h = old[:n-1]
 	return entry

@@ -11,20 +11,20 @@ import (
 
 // pbConfig holds mutable state during PulseBoard construction.
 type pbConfig struct {
-	title                string
-	endpoints            []Endpoint
-	pollingInterval      time.Duration
-	port                 int
-	maxConcurrency       int
-	logger               *slog.Logger
+	title                 string
+	endpoints             []Endpoint
+	pollingInterval       time.Duration
+	port                  int
+	maxConcurrency        int
+	logger                *slog.Logger
 	statusCallbacks       []func(StatusResult)
 	statusChangeCallbacks []func(StatusChange)
 	blockPrivateNetworks  bool
-	allowedHosts         []string
-	middleware           []func(http.Handler) http.Handler
-	staleThreshold       time.Duration
-	staleThresholdSet    bool
-	metricsEnabled       bool
+	allowedHosts          []string
+	middleware            []func(http.Handler) http.Handler
+	staleThreshold        time.Duration
+	staleThresholdSet     bool
+	metricsEnabled        bool
 
 	// Server TLS
 	tlsCertFile string

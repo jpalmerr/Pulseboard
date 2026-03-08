@@ -46,20 +46,20 @@ const (
 // The caller controls the lifecycle via the context. Cancel the context to
 // trigger graceful shutdown.
 type PulseBoard struct {
-	title                string
-	endpoints            []Endpoint
-	pollingInterval      time.Duration
-	port                 int
-	maxConcurrency       int
+	title                 string
+	endpoints             []Endpoint
+	pollingInterval       time.Duration
+	port                  int
+	maxConcurrency        int
 	logger                *slog.Logger
 	statusCallbacks       []func(StatusResult)
 	statusChangeCallbacks []func(StatusChange)
 	blockPrivateNetworks  bool
-	allowedHosts         []string
-	middleware           []func(http.Handler) http.Handler
-	staleThreshold       time.Duration
-	staleThresholdSet    bool
-	metricsEnabled       bool
+	allowedHosts          []string
+	middleware            []func(http.Handler) http.Handler
+	staleThreshold        time.Duration
+	staleThresholdSet     bool
+	metricsEnabled        bool
 
 	// Server TLS
 	tlsCertFile string
@@ -127,26 +127,26 @@ func New(opts ...Option) (*PulseBoard, error) {
 	}
 
 	return &PulseBoard{
-		title:                cfg.title,
-		endpoints:            cfg.endpoints,
-		pollingInterval:      cfg.pollingInterval,
-		port:                 cfg.port,
-		maxConcurrency:       cfg.maxConcurrency,
+		title:                 cfg.title,
+		endpoints:             cfg.endpoints,
+		pollingInterval:       cfg.pollingInterval,
+		port:                  cfg.port,
+		maxConcurrency:        cfg.maxConcurrency,
 		logger:                logger,
 		statusCallbacks:       cfg.statusCallbacks,
 		statusChangeCallbacks: cfg.statusChangeCallbacks,
 		blockPrivateNetworks:  cfg.blockPrivateNetworks,
-		allowedHosts:         cfg.allowedHosts,
-		middleware:           cfg.middleware,
-		staleThreshold:       cfg.staleThreshold,
-		staleThresholdSet:    cfg.staleThresholdSet,
-		metricsEnabled:       cfg.metricsEnabled,
-		tlsCertFile:          cfg.tlsCertFile,
-		tlsKeyFile:           cfg.tlsKeyFile,
-		clientTLSInsecure:    cfg.clientTLSInsecure,
-		clientTLSMinVersion:  cfg.clientTLSMinVersion,
-		clientTLSCertFile:    cfg.clientTLSCertFile,
-		clientTLSKeyFile:     cfg.clientTLSKeyFile,
+		allowedHosts:          cfg.allowedHosts,
+		middleware:            cfg.middleware,
+		staleThreshold:        cfg.staleThreshold,
+		staleThresholdSet:     cfg.staleThresholdSet,
+		metricsEnabled:        cfg.metricsEnabled,
+		tlsCertFile:           cfg.tlsCertFile,
+		tlsKeyFile:            cfg.tlsKeyFile,
+		clientTLSInsecure:     cfg.clientTLSInsecure,
+		clientTLSMinVersion:   cfg.clientTLSMinVersion,
+		clientTLSCertFile:     cfg.clientTLSCertFile,
+		clientTLSKeyFile:      cfg.clientTLSKeyFile,
 	}, nil
 }
 

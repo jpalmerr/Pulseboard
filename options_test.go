@@ -511,11 +511,11 @@ func TestWithTLS(t *testing.T) {
 	ep, _ := NewEndpoint("Test", "https://example.com")
 
 	tests := []struct {
-		name     string
-		cert     string
-		key      string
-		wantErr  bool
-		errLike  string
+		name    string
+		cert    string
+		key     string
+		wantErr bool
+		errLike string
 	}{
 		{
 			name:    "valid cert and key paths",

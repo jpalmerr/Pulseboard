@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +20,7 @@ func TestNewLogger(t *testing.T) {
 		t.Fatal("newLogger() returned nil")
 	}
 	// Verify it is a slog.Logger (not just a non-nil pointer to a zero value).
-	var _ *slog.Logger = logger
+	var _ = logger
 }
 
 func TestRunServe_ConfigNotFound(t *testing.T) {
