@@ -89,6 +89,30 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if cfg.Title != "" {
 		opts = append(opts, pulseboard.WithTitle(cfg.Title))
 	}
+	if cfg.BlockPrivateNetworks {
+		opts = append(opts, pulseboard.WithBlockPrivateNetworks())
+	}
+	if mw := config.BuildAuthMiddleware(cfg.Auth); mw != nil {
+		opts = append(opts, pulseboard.WithMiddleware(mw))
+	}
+
+	// apply server TLS options
+	for _, opt := range config.BuildServerTLSOptions(cfg) {
+		opts = append(opts, opt)
+	}
+
+	// apply client TLS options
+	clientTLSOpts, err := config.BuildClientTLSOptions(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to build client TLS options: %w", err)
+	}
+	opts = append(opts, clientTLSOpts...)
+
+	// apply webhook options
+	opts = append(opts, config.BuildWebhookOptions(cfg)...)
+
+	// apply metrics options
+	opts = append(opts, config.BuildMetricsOption(cfg)...)
 
 	pb, err := pulseboard.New(opts...)
 	if err != nil {

@@ -22,21 +22,57 @@
 package config
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
-	"text/template"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/jpalmerr/pulseboard/internal/urltmpl"
 )
 
 // minPollInterval is the minimum allowed polling interval for production configs.
 // This prevents accidental DoS of endpoints with overly aggressive polling.
 const minPollInterval = 1 * time.Second
+
+// ServerTLSConfig holds TLS configuration for the dashboard server.
+type ServerTLSConfig struct {
+	// CertFile is the path to the TLS certificate PEM file.
+	CertFile string `yaml:"cert_file"`
+	// KeyFile is the path to the TLS private key PEM file.
+	KeyFile string `yaml:"key_file"`
+}
+
+// ClientTLSConfig holds TLS configuration for the polling HTTP client.
+type ClientTLSConfig struct {
+	// InsecureSkipVerify disables TLS certificate verification.
+	// WARNING: Use only for development or trusted internal services.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	// MinVersion sets the minimum TLS version: "1.0", "1.1", "1.2", "1.3".
+	// Defaults to TLS 1.2 when any client TLS option is active.
+	MinVersion string `yaml:"min_version"`
+	// ClientCert is the path to the client certificate PEM file (for mTLS).
+	ClientCert string `yaml:"client_cert"`
+	// ClientKey is the path to the client private key PEM file (for mTLS).
+	ClientKey string `yaml:"client_key"`
+}
+
+// ServerConfig holds server-level configuration.
+type ServerConfig struct {
+	// TLS holds optional TLS settings. Omit for plain HTTP.
+	TLS *ServerTLSConfig `yaml:"tls"`
+}
+
+// ClientConfig holds client-level configuration for polling.
+type ClientConfig struct {
+	// TLS holds optional TLS settings for the polling client.
+	TLS *ClientTLSConfig `yaml:"tls"`
+}
 
 // Config is the root configuration structure for PulseBoard.
 //
@@ -54,11 +90,93 @@ type Config struct {
 	// Defaults to 10s.
 	PollInterval Duration `yaml:"poll_interval"`
 
+	// BlockPrivateNetworks enables SSRF protection when true.
+	// Requests to RFC1918, loopback, link-local, and cloud metadata
+	// addresses are rejected before the HTTP request is made.
+	BlockPrivateNetworks bool `yaml:"block_private_networks"`
+
+	// Auth configures authentication for the dashboard and API.
+	// If nil, all endpoints are open (no authentication required).
+	Auth *AuthConfig `yaml:"auth"`
+
+	// Server holds server-level configuration including TLS.
+	Server *ServerConfig `yaml:"server"`
+
+	// Client holds polling client configuration including TLS.
+	Client *ClientConfig `yaml:"client"`
+
 	// Endpoints defines individual health check endpoints.
 	Endpoints []EndpointConfig `yaml:"endpoints"`
 
 	// Grids defines endpoint grids that expand via cartesian product.
 	Grids []GridConfig `yaml:"grids"`
+
+	// Webhooks defines HTTP webhook notifications triggered by status changes.
+	Webhooks []WebhookConfig `yaml:"webhooks"`
+
+	// Metrics configures the optional Prometheus /metrics endpoint.
+	// If nil or Enabled is false, no /metrics route is registered.
+	Metrics *MetricsConfig `yaml:"metrics"`
+}
+
+// MetricsConfig holds Prometheus metrics exposition settings.
+type MetricsConfig struct {
+	// Enabled controls whether /metrics is registered. Default: false.
+	Enabled bool `yaml:"enabled"`
+}
+
+// WebhookConfig defines an HTTP webhook that fires on status transitions.
+type WebhookConfig struct {
+	// URL is the HTTP endpoint to POST the status change to.
+	URL string `yaml:"url"`
+
+	// Events restricts notifications to specific target statuses.
+	// Example: ["down", "degraded"] — only fires when current status is down or degraded.
+	// If empty, all transitions fire the webhook.
+	Events []string `yaml:"events"`
+
+	// Headers are custom HTTP headers included in each POST request.
+	// Values support environment variable substitution: ${VAR} or ${VAR:-default}.
+	Headers map[string]string `yaml:"headers"`
+
+	// Timeout is the HTTP request timeout in seconds. Default: 10.
+	Timeout int `yaml:"timeout"`
+
+	// Debounce is the minimum seconds a status must remain changed before the
+	// webhook fires. Default: 0 (no debounce).
+	Debounce int `yaml:"debounce"`
+}
+
+// AuthConfig configures authentication for the PulseBoard HTTP server.
+//
+// Example YAML (Basic Auth):
+//
+//	auth:
+//	  type: basic
+//	  username: admin
+//	  password: secret
+//
+// Example YAML (Bearer Token):
+//
+//	auth:
+//	  type: bearer
+//	  token: my-secret-token
+type AuthConfig struct {
+	// Type is the authentication type: "basic" or "bearer".
+	Type string `yaml:"type"`
+
+	// Username is the required username for Basic Auth.
+	Username string `yaml:"username"`
+
+	// Password is the required password for Basic Auth.
+	Password string `yaml:"password"`
+
+	// Token is a single valid Bearer token.
+	Token string `yaml:"token"`
+
+	// Tokens is a list of valid Bearer tokens.
+	// Takes precedence over Token when both are set.
+	Tokens []string `yaml:"tokens"`
 }
 
 // EndpointConfig defines a single health check endpoint.
@@ -225,9 +343,8 @@ func (e *ExtractorConfig) parseShorthand(s string) error {
 		return nil
 	}
 
-	if idx := strings.Index(s, ":"); idx != -1 {
-		e.Type = s[:idx]
-		value := s[idx+1:]
+	if typ, value, ok := strings.Cut(s, ":"); ok {
+		e.Type = typ
 
 		switch e.Type {
 		case "json":
@@ -420,8 +537,8 @@ func (c *Config) expandAndValidate() error {
 		}
 		g.URLTemplate = expanded
 
-		// fail fast before SDK tries to use invalid template
-		if _, err := template.New("").Parse(g.URLTemplate); err != nil {
+		// fail fast: validate placeholder syntax and referenced dimensions
+		if err := urltmpl.Validate(g.URLTemplate, g.Dimensions); err != nil {
 			return fmt.Errorf("grids[%d] (%s): invalid url_template: %w", i, g.Name, err)
 		}
 
@@ -480,11 +597,174 @@ func (c *Config) expandAndValidate() error {
 		}
 	}
 
+	if c.Auth != nil {
+		if err := c.expandAndValidateAuth(); err != nil {
+			return err
+		}
+	}
+
+	if c.Server != nil && c.Server.TLS != nil {
+		if err := validateServerTLS(c.Server.TLS); err != nil {
+			return err
+		}
+	}
+	if c.Client != nil && c.Client.TLS != nil {
+		if err := validateClientTLS(c.Client.TLS); err != nil {
+			return err
+		}
+	}
+
+	for i := range c.Webhooks {
+		wh := &c.Webhooks[i]
+		if wh.URL == "" {
+			return fmt.Errorf("webhooks[%d]: url is required", i)
+		}
+		expanded, err := expandEnvVars(wh.URL)
+		if err != nil {
+			return fmt.Errorf("webhooks[%d]: url: %w", i, err)
+		}
+		wh.URL = expanded
+
+		for k, v := range wh.Headers {
+			expanded, err := expandEnvVars(v)
+			if err != nil {
+				return fmt.Errorf("webhooks[%d]: headers[%s]: %w", i, k, err)
+			}
+			wh.Headers[k] = expanded
+		}
+
+		if wh.Timeout < 0 {
+			return fmt.Errorf("webhooks[%d]: timeout must be non-negative", i)
+		}
+		if wh.Debounce < 0 {
+			return fmt.Errorf("webhooks[%d]: debounce must be non-negative", i)
+		}
+	}
+
 	if len(c.Endpoints) == 0 && len(c.Grids) == 0 {
 		return errors.New("at least one endpoint or grid must be defined")
 	}
 
 	return nil
+}
+
+// expandAndValidateAuth expands environment variables in auth fields and
+// validates that the auth configuration is complete and coherent.
+func (c *Config) expandAndValidateAuth() error {
+	auth := c.Auth
+
+	switch auth.Type {
+	case "basic":
+		expanded, err := expandEnvVars(auth.Username)
+		if err != nil {
+			return fmt.Errorf("auth.username: %w", err)
+		}
+		auth.Username = expanded
+
+		expanded, err = expandEnvVars(auth.Password)
+		if err != nil {
+			return fmt.Errorf("auth.password: %w", err)
+		}
+		auth.Password = expanded
+
+		if auth.Username == "" {
+			return fmt.Errorf("auth: basic auth requires a non-empty username")
+		}
+		if auth.Password == "" {
+			return fmt.Errorf("auth: basic auth requires a non-empty password")
+		}
+
+	case "bearer":
+		expanded, err := expandEnvVars(auth.Token)
+		if err != nil {
+			return fmt.Errorf("auth.token: %w", err)
+		}
+		auth.Token = expanded
+
+		for i := range auth.Tokens {
+			expanded, err := expandEnvVars(auth.Tokens[i])
+			if err != nil {
+				return fmt.Errorf("auth.tokens[%d]: %w", i, err)
+			}
+			auth.Tokens[i] = expanded
+		}
+
+		// require at least one non-empty token
+		hasToken := auth.Token != ""
+		if !hasToken {
+			for _, t := range auth.Tokens {
+				if t != "" {
+					hasToken = true
+					break
+				}
+			}
+		}
+		if !hasToken {
+			return fmt.Errorf("auth: bearer auth requires at least one non-empty token")
+		}
+
+	default:
+		return fmt.Errorf("auth: unknown type %q (must be \"basic\" or \"bearer\")", auth.Type)
+	}
+
+	return nil
+}
+
+// validateServerTLS validates server TLS configuration.
+func validateServerTLS(t *ServerTLSConfig) error {
+	if t.CertFile == "" && t.KeyFile == "" {
+		return nil // empty TLS section is a no-op
+	}
+	if t.CertFile == "" {
+		return errors.New("server.tls.cert_file is required when server.tls is configured")
+	}
+	if t.KeyFile == "" {
+		return errors.New("server.tls.key_file is required when server.tls is configured")
+	}
+	if _, err := os.Stat(t.CertFile); err != nil {
+		return fmt.Errorf("server.tls.cert_file: %w", err)
+	}
+	if _, err := os.Stat(t.KeyFile); err != nil {
+		return fmt.Errorf("server.tls.key_file: %w", err)
+	}
+	return nil
+}
+
+// validateClientTLS validates client TLS configuration.
+func validateClientTLS(t *ClientTLSConfig) error {
+	if t.MinVersion != "" {
+		if _, err := parseTLSVersion(t.MinVersion); err != nil {
+			return fmt.Errorf("client.tls.min_version: %w", err)
+		}
+	}
+	if (t.ClientCert == "") != (t.ClientKey == "") {
+		return errors.New("client.tls.client_cert and client.tls.client_key must both be set or both be empty")
+	}
+	if t.ClientCert != "" {
+		if _, err := os.Stat(t.ClientCert); err != nil {
+			return fmt.Errorf("client.tls.client_cert: %w", err)
+		}
+		if _, err := os.Stat(t.ClientKey); err != nil {
+			return fmt.Errorf("client.tls.client_key: %w", err)
+		}
+	}
+	return nil
+}
+
+// parseTLSVersion converts a version string to a crypto/tls version constant.
+func parseTLSVersion(s string) (uint16, error) {
+	switch s {
+	case "1.0":
+		return tls.VersionTLS10, nil
+	case "1.1":
+		return tls.VersionTLS11, nil
+	case "1.2":
+		return tls.VersionTLS12, nil
+	case "1.3":
+		return tls.VersionTLS13, nil
+	default:
+		return 0, fmt.Errorf("unknown TLS version %q (expected \"1.0\", \"1.1\", \"1.2\", or \"1.3\")", s)
+	}
 }
 
 // validateExtractor validates an extractor configuration.

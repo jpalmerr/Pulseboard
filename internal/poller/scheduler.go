@@ -1,6 +1,7 @@
 package poller
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"log/slog"
@@ -9,40 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jpalmerr/pulseboard/internal/types"
 )
-
-// StatusResult holds the outcome of polling a single endpoint.
-//
-// StatusResult contains all information about a poll attempt, including
-// the determined status, timing information, and any error that occurred.
-type StatusResult struct {
-	// EndpointName is the display name of the polled endpoint.
-	EndpointName string
-
-	// URL is the target URL that was polled.
-	URL string
-
-	// Status is the determined health status as a string (e.g., "up", "down").
-	Status string
-
-	// Labels contains the key-value metadata associated with the endpoint.
-	Labels map[string]string
-
-	// Latency is the time taken to complete the HTTP request.
-	Latency time.Duration
-
-	// CheckedAt is the timestamp when the poll was performed.
-	CheckedAt time.Time
-
-	// Error contains any error that occurred during polling.
-	Error error
-
-	// RawResponse contains the HTTP response body for debugging.
-	RawResponse []byte
-
-	// StatusCode is the HTTP status code returned by the endpoint.
-	StatusCode int
-}
 
 // StatusExtractor is a function that determines status from an HTTP response.
 //
@@ -82,15 +51,132 @@ type EndpointInfo struct {
 	Interval time.Duration
 }
 
+// pollEntry is a single entry in the priority queue, pairing an endpoint with
+// its scheduled next-poll time.
+type pollEntry struct {
+	endpoint EndpointInfo
+	nextPoll time.Time
+	// index is maintained by heap.Interface for O(log n) operations.
+	index int
+}
+
+// pollEntryHeap is the internal slice backing the min-heap ordered by nextPoll.
+// It implements heap.Interface directly; callers must hold pollQueue.mu.
+type pollEntryHeap []*pollEntry
+
+// Len returns the number of entries in the heap.
+func (h pollEntryHeap) Len() int { return len(h) }
+
+// Less reports whether entry i should be popped before entry j.
+// The heap is a min-heap on nextPoll (earliest due time at the top).
+func (h pollEntryHeap) Less(i, j int) bool {
+	return h[i].nextPoll.Before(h[j].nextPoll)
+}
+
+// Swap exchanges entries i and j and updates their stored indices.
+func (h pollEntryHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+
+// Push appends a new entry to the heap slice (called by container/heap).
+func (h *pollEntryHeap) Push(x any) {
+	entry := x.(*pollEntry)
+	entry.index = len(*h)
+	*h = append(*h, entry)
+}
+
+// Pop removes and returns the last entry from the heap slice (called by container/heap).
+// The heap package swaps the minimum to the end before calling Pop, so this
+// removes the previously-minimum entry.
+func (h *pollEntryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	entry := old[n-1]
+	old[n-1] = nil  // prevent memory leak
+	entry.index = -1 // mark as removed
+	*h = old[:n-1]
+	return entry
+}
+
+// pollQueue is a min-heap of poll entries ordered by next-due time.
+// All exported methods are safe for concurrent use.
+type pollQueue struct {
+	entries pollEntryHeap
+	mu      sync.Mutex
+}
+
+// newPollQueue creates a pollQueue pre-populated with all endpoints, each
+// scheduled for immediate polling (nextPoll = now).
+func newPollQueue(endpoints []EndpointInfo) *pollQueue {
+	now := time.Now()
+	q := &pollQueue{
+		entries: make(pollEntryHeap, len(endpoints)),
+	}
+	for i, ep := range endpoints {
+		q.entries[i] = &pollEntry{
+			endpoint: ep,
+			nextPoll: now,
+			index:    i,
+		}
+	}
+	heap.Init(&q.entries)
+	return q
+}
+
+// push schedules ep for polling at nextPoll. Safe for concurrent use.
+func (q *pollQueue) push(ep EndpointInfo, nextPoll time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	heap.Push(&q.entries, &pollEntry{endpoint: ep, nextPoll: nextPoll})
+}
+
+// popDue removes and returns all entries whose nextPoll is at or before now.
+// Safe for concurrent use.
+func (q *pollQueue) popDue(now time.Time) []EndpointInfo {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	var due []EndpointInfo
+	for q.entries.Len() > 0 && !q.entries[0].nextPoll.After(now) {
+		entry := heap.Pop(&q.entries).(*pollEntry)
+		due = append(due, entry.endpoint)
+	}
+	return due
+}
+
+// peek returns the duration until the next entry is due.
+// Returns 100ms if the queue is empty (prevents scheduler from spinning).
+// Never returns 0 or a negative duration. Safe for concurrent use.
+func (q *pollQueue) peek() time.Duration {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.entries.Len() == 0 {
+		return 100 * time.Millisecond
+	}
+	d := time.Until(q.entries[0].nextPoll)
+	if d <= 0 {
+		// Entry is already due; yield a minimal sleep so the caller can act.
+		return time.Millisecond
+	}
+	return d
+}
+
+// empty reports whether the queue has no entries. Safe for concurrent use.
+func (q *pollQueue) empty() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.entries.Len() == 0
+}
+
 // Scheduler manages periodic polling of multiple endpoints.
 //
-// Scheduler implements a worker pool pattern, polling configured endpoints
-// at their respective intervals with configurable concurrency. Results are
-// emitted to a channel that can be consumed by the caller.
-//
-// The scheduler polls all endpoints immediately on start, then uses a
-// tick-and-check pattern where it ticks at the GCD of all endpoint intervals
-// and polls only endpoints that are due.
+// Scheduler implements a persistent worker pool backed by a priority queue.
+// Endpoints are polled at their respective intervals; the scheduler wakes only
+// when the next endpoint is due, eliminating O(n) work on every tick. Results
+// are emitted to a channel that can be consumed by the caller.
 //
 // All lifecycle methods (Start, Stop) are safe for concurrent use.
 type Scheduler struct {
@@ -98,7 +184,7 @@ type Scheduler struct {
 	interval       time.Duration // global default interval
 	maxConcurrency int
 	client         *Client
-	results        chan StatusResult
+	results        chan types.StatusResult
 	logger         *slog.Logger
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -109,9 +195,8 @@ type Scheduler struct {
 	stopped   bool
 	closeOnce sync.Once
 
-	// per-endpoint timing for tick-and-check pattern
-	lastPolledAt map[string]time.Time
-	baseInterval time.Duration
+	queue    *pollQueue
+	jobsChan chan EndpointInfo
 }
 
 // NewScheduler creates a new polling [Scheduler].
@@ -119,19 +204,27 @@ type Scheduler struct {
 // Parameters:
 //   - endpoints: List of endpoints to poll
 //   - interval: Time between polling cycles
-//   - maxConcurrency: Maximum number of concurrent HTTP requests
+//   - maxConcurrency: Maximum number of concurrent HTTP requests. If <= 0 it is
+//     silently clamped to 1.
 //   - logger: Logger for scheduler events (panic recovery, etc.)
+//   - clientOpts: Optional [ClientOption] values applied to the underlying HTTP client
 //
 // The scheduler must be started with [Scheduler.Start] and stopped with
 // [Scheduler.Stop]. Results are available via [Scheduler.Results].
-func NewScheduler(endpoints []EndpointInfo, interval time.Duration, maxConcurrency int, logger *slog.Logger) *Scheduler {
+func NewScheduler(endpoints []EndpointInfo, interval time.Duration, maxConcurrency int, logger *slog.Logger, clientOpts ...ClientOption) *Scheduler {
+	if maxConcurrency <= 0 {
+		maxConcurrency = 1
+	}
 	return &Scheduler{
 		endpoints:      endpoints,
 		interval:       interval,
 		maxConcurrency: maxConcurrency,
-		client:         NewClient(),
-		results:        make(chan StatusResult, len(endpoints)),
-		logger:         logger,
+		client:         NewClient(clientOpts...),
+		// Buffer sized to len(endpoints) to absorb the initial burst where all
+		// endpoints are polled simultaneously. Workers back-pressure naturally if
+		// the consumer falls behind. Minimum 1 to avoid blocking on zero endpoints.
+		results: make(chan types.StatusResult, max(len(endpoints), 1)),
+		logger:  logger,
 	}
 }
 
@@ -139,53 +232,16 @@ func NewScheduler(endpoints []EndpointInfo, interval time.Duration, maxConcurren
 //
 // The channel is closed when the scheduler stops. Consumers should read from
 // this channel until it is closed to receive all poll results.
-func (s *Scheduler) Results() <-chan StatusResult {
+func (s *Scheduler) Results() <-chan types.StatusResult {
 	return s.results
-}
-
-// calculateBaseInterval determines the tick interval for the scheduler.
-// Uses the GCD of all endpoint intervals to ensure timely polling.
-func (s *Scheduler) calculateBaseInterval() time.Duration {
-	if len(s.endpoints) == 0 {
-		return s.interval
-	}
-
-	intervals := make([]time.Duration, 0, len(s.endpoints))
-	for _, ep := range s.endpoints {
-		if ep.Interval > 0 {
-			intervals = append(intervals, ep.Interval)
-		} else {
-			intervals = append(intervals, s.interval)
-		}
-	}
-
-	result := intervals[0]
-	for _, d := range intervals[1:] {
-		result = gcdDuration(result, d)
-	}
-
-	// floor at 1 second to prevent CPU thrashing
-	if result < time.Second {
-		result = time.Second
-	}
-
-	return result
-}
-
-// gcdDuration calculates the greatest common divisor of two durations.
-func gcdDuration(a, b time.Duration) time.Duration {
-	for b != 0 {
-		a, b = b, a%b
-	}
-	return a
 }
 
 // Start begins the polling loop in a background goroutine.
 //
 // Start is non-blocking and returns immediately. The scheduler will:
-//  1. Poll all endpoints immediately
-//  2. Tick at the GCD of all endpoint intervals
-//  3. Poll only endpoints that are due on each tick
+//  1. Poll all endpoints immediately (nextPoll initialised to time.Now())
+//  2. Use a priority queue to wake only when the next endpoint is due
+//  3. Dispatch due endpoints to a persistent worker pool
 //  4. Continue until [Scheduler.Stop] is called or the context is cancelled
 //
 // If ctx is nil, context.Background() is used as the parent context.
@@ -198,41 +254,33 @@ func (s *Scheduler) Start(ctx context.Context) {
 		return
 	}
 	s.started = true
-	s.lastPolledAt = make(map[string]time.Time, len(s.endpoints))
-	s.baseInterval = s.calculateBaseInterval()
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	pollCtx := s.ctx // capture under lock to avoid race
+
+	s.queue = newPollQueue(s.endpoints)
+	s.jobsChan = make(chan EndpointInfo, s.maxConcurrency)
+
+	// Spawn persistent worker pool before releasing the lock so all goroutines
+	// are counted in s.wg before Stop() can call s.wg.Wait().
+	for i := 0; i < s.maxConcurrency; i++ {
+		s.wg.Add(1)
+		go s.worker(s.jobsChan, pollCtx)
+	}
 	s.wg.Add(1)
+	go s.schedulerLoop(pollCtx)
+
 	s.mu.Unlock()
-
-	go func() {
-		defer s.wg.Done()
-		defer s.closeOnce.Do(func() { close(s.results) })
-
-		s.pollDueEndpoints(pollCtx, true)
-
-		ticker := time.NewTicker(s.baseInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-pollCtx.Done():
-				return
-			case <-ticker.C:
-				s.pollDueEndpoints(pollCtx, false)
-			}
-		}
-	}()
 }
 
 // Stop halts the scheduler and waits for all goroutines to complete.
 //
 // Stop cancels the scheduler's context and blocks until:
-//   - The polling loop exits
+//   - The scheduler loop exits
+//   - All workers drain jobsChan and exit
 //   - All in-flight requests complete
 //   - The results channel is closed
 //
@@ -259,100 +307,96 @@ func (s *Scheduler) Stop() {
 	s.closeOnce.Do(func() { close(s.results) })
 }
 
-// pollDueEndpoints polls only endpoints that are due based on their intervals.
-// If immediate is true, polls all endpoints regardless of timing.
-//
-// TIMING SEMANTIC: lastPolledAt is updated when a poll STARTS, not when it
-// completes. This prevents concurrent polls of the same endpoint but means
-// effective interval = configured interval + poll duration for slow endpoints.
-func (s *Scheduler) pollDueEndpoints(ctx context.Context, immediate bool) {
-	now := time.Now()
-	dueEndpoints := make([]EndpointInfo, 0, len(s.endpoints))
+// schedulerLoop is the single goroutine that drives the priority queue.
+// It wakes when the next entry is due, pops all due endpoints, and sends
+// them to jobsChan. It closes jobsChan on exit so workers drain and stop.
+func (s *Scheduler) schedulerLoop(ctx context.Context) {
+	defer s.wg.Done()
+	defer close(s.jobsChan) // workers exit once jobsChan is drained
 
-	s.mu.Lock()
-	for _, ep := range s.endpoints {
-		if immediate {
-			dueEndpoints = append(dueEndpoints, ep)
-			s.lastPolledAt[ep.Name] = now
-			continue
-		}
+	for {
+		sleep := s.queue.peek() // 100ms default if empty; never 0
 
-		interval := ep.Interval
-		if interval == 0 {
-			interval = s.interval // use global default
-		}
-
-		lastPolled, exists := s.lastPolledAt[ep.Name]
-		if !exists || now.Sub(lastPolled) >= interval {
-			dueEndpoints = append(dueEndpoints, ep)
-			s.lastPolledAt[ep.Name] = now
-		}
-	}
-	s.mu.Unlock()
-
-	if len(dueEndpoints) == 0 {
-		return
-	}
-
-	s.pollEndpoints(ctx, dueEndpoints)
-}
-
-// pollEndpoints polls a subset of endpoints concurrently, respecting maxConcurrency.
-func (s *Scheduler) pollEndpoints(ctx context.Context, endpoints []EndpointInfo) {
-	jobs := make(chan EndpointInfo, len(endpoints))
-
-	var wg sync.WaitGroup
-	for i := 0; i < s.maxConcurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ep := range jobs {
-				result := s.pollEndpoint(ctx, ep)
+		timer := time.NewTimer(sleep)
+		select {
+		case <-timer.C:
+			timer.Stop()
+			now := time.Now()
+			due := s.queue.popDue(now)
+			for _, ep := range due {
+				interval := ep.Interval
+				if interval == 0 {
+					interval = s.interval
+				}
 				select {
-				case s.results <- result:
+				case s.jobsChan <- ep:
+					// Re-schedule the endpoint for its next poll. The next
+					// poll time is based on when we dispatched (now), not when
+					// the HTTP response returns, matching the original semantic.
+					s.queue.push(ep, now.Add(interval))
 				case <-ctx.Done():
+					// Remaining due entries are not re-inserted. At shutdown this is
+					// intentional — the scheduler cannot be restarted, so dropped
+					// entries have no effect on future operation.
 					return
 				}
 			}
-		}()
-	}
-
-	for _, ep := range endpoints {
-		select {
-		case jobs <- ep:
 		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
+			timer.Stop()
 			return
 		}
 	}
-	close(jobs)
+}
 
-	wg.Wait()
+// worker reads endpoints from jobs and polls each one, forwarding results to
+// the results channel. It exits when jobs is closed or ctx is cancelled.
+func (s *Scheduler) worker(jobs <-chan EndpointInfo, ctx context.Context) {
+	defer s.wg.Done()
+	for {
+		select {
+		case ep, ok := <-jobs:
+			if !ok {
+				return
+			}
+			result := s.pollEndpoint(ctx, ep)
+			select {
+			case s.results <- result:
+			case <-ctx.Done():
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // pollEndpoint polls a single endpoint and returns the result.
-func (s *Scheduler) pollEndpoint(ctx context.Context, ep EndpointInfo) StatusResult {
+func (s *Scheduler) pollEndpoint(ctx context.Context, ep EndpointInfo) types.StatusResult {
 	resp := s.client.Fetch(ctx, ep.Method, ep.URL, ep.Headers, ep.Timeout)
 
-	result := StatusResult{
-		EndpointName: ep.Name,
-		URL:          ep.URL,
-		Labels:       ep.Labels,
-		Latency:      resp.Latency,
-		CheckedAt:    time.Now(),
-		RawResponse:  resp.Body,
-		StatusCode:   resp.StatusCode,
-		Error:        resp.Error,
+	result := types.StatusResult{
+		EndpointName:   ep.Name,
+		URL:            ep.URL,
+		Labels:         ep.Labels,
+		Latency:        resp.Latency,
+		ResponseTimeMs: resp.Latency.Milliseconds(),
+		CheckedAt:      time.Now(),
+		RawResponse:    resp.Body,
+		StatusCode:     resp.StatusCode,
+		Error:          resp.Error,
 	}
 
 	if resp.Error != nil {
 		result.Status = "down"
+		s := resp.Error.Error()
+		result.ErrorStr = &s
 	} else if ep.Extractor != nil {
 		status, err := s.safeExtract(ep.Extractor, resp.Body, resp.StatusCode)
 		result.Status = status
 		if err != nil {
 			result.Error = err
+			e := err.Error()
+			result.ErrorStr = &e
 		}
 	} else {
 		// default: use HTTP status code
@@ -364,7 +408,7 @@ func (s *Scheduler) pollEndpoint(ctx context.Context, ep EndpointInfo) StatusRes
 
 // safeExtract calls the extractor with panic recovery.
 // If the extractor panics, it logs the full stack trace with a correlation ID
-// and returns "down" status with a user-friendly error containing the ID.
+// and returns "error" status with a user-friendly error containing the ID.
 func (s *Scheduler) safeExtract(extractor StatusExtractor, body []byte, statusCode int) (status string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -378,7 +422,7 @@ func (s *Scheduler) safeExtract(extractor StatusExtractor, body []byte, statusCo
 				"stack", string(stack),
 			)
 
-			status = "down"
+			status = "error"
 			err = fmt.Errorf("extractor panic (correlation_id: %s)", correlationID)
 		}
 	}()
@@ -392,6 +436,9 @@ func httpStatusToStatus(code int) string {
 		return "up"
 	case code >= 400 && code < 500:
 		return "degraded"
+	// 1xx and 3xx (if redirect limit exceeded) are treated as down.
+	// The http.Client follows redirects automatically (up to 10 per request),
+	// so 3xx responses are only seen here in exceptional cases.
 	default:
 		return "down"
 	}

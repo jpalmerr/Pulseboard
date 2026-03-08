@@ -2,10 +2,41 @@ package pulseboard
 
 import "time"
 
+// StatusChange represents a transition between two statuses for a single endpoint.
+//
+// StatusChange is passed to callbacks registered with [WithStatusChangeCallback]
+// and is the payload sent by [WebhookNotifier].
+type StatusChange struct {
+	// EndpointName is the display name of the endpoint.
+	EndpointName string `json:"endpoint_name"`
+
+	// URL is the endpoint's URL.
+	URL string `json:"url"`
+
+	// Labels are the endpoint's key-value metadata.
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// PreviousStatus is the status before the change.
+	// Empty string ("") indicates this is the first poll result for this endpoint.
+	PreviousStatus Status `json:"previous_status"`
+
+	// CurrentStatus is the status after the change.
+	CurrentStatus Status `json:"current_status"`
+
+	// LatencyMs is the HTTP request duration in milliseconds.
+	LatencyMs int64 `json:"latency_ms"`
+
+	// CheckedAt is when the poll completed.
+	CheckedAt time.Time `json:"checked_at"`
+
+	// Error is the error string from the poll, if any. Empty string means no error.
+	Error string `json:"error,omitempty"`
+}
+
 // Status represents the health state of an endpoint.
 //
-// Status is a string type that can hold one of four predefined values:
-// [StatusUp], [StatusDown], [StatusDegraded], or [StatusUnknown].
+// Status is a string type that can hold one of five predefined values:
+// [StatusUp], [StatusDown], [StatusDegraded], [StatusUnknown], or [StatusError].
 // Using a string type allows for easy JSON serialization and human-readable
 // logging while maintaining type safety through the defined constants.
 type Status string
@@ -23,6 +54,12 @@ const (
 	// StatusUnknown indicates the status could not be determined.
 	// This typically occurs when an extractor cannot parse the response.
 	StatusUnknown Status = "unknown"
+
+	// StatusError indicates the check mechanism itself failed (extractor panic,
+	// JSON parse error, regex mismatch, missing field). The service status is
+	// unknown because the check could not complete.
+	// This is distinct from [StatusDown] (service unreachable).
+	StatusError Status = "error"
 )
 
 // String returns the string representation of the status.
@@ -50,7 +87,7 @@ func (s Status) String() string {
 // # Panic Safety
 //
 // StatusExtractor functions are called within a panic recovery boundary.
-// If an extractor panics, the endpoint's status will be set to [StatusDown]
+// If an extractor panics, the endpoint's status will be set to [StatusError]
 // with an error containing a correlation ID. The full stack trace is logged
 // server-side for debugging. This ensures that a misbehaving extractor cannot
 // crash the entire PulseBoard server.

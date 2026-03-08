@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -329,13 +331,14 @@ func TestParse_GridTemplateValidation(t *testing.T) {
 	}{
 		{
 			name:     "valid template",
-			template: "https://{{.env}}.example.com/{{.svc}}/health",
+			template: "https://{{.env}}.example.com/health",
 			wantErr:  false,
 		},
 		{
-			name:     "valid template with conditionals",
-			template: "https://{{if .secure}}secure{{else}}api{{end}}.example.com",
-			wantErr:  false,
+			name:        "conditional syntax not supported",
+			template:    "https://{{if .secure}}secure{{else}}api{{end}}.example.com",
+			wantErr:     true,
+			wantErrLike: "invalid url_template",
 		},
 		{
 			name:        "unclosed braces",
@@ -1191,6 +1194,186 @@ func TestExpandEnvVars(t *testing.T) {
 	}
 }
 
+// --- Auth config parsing tests ---
+
+func TestParse_AuthConfig_Basic(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: basic
+  username: admin
+  password: secret
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if cfg.Auth == nil {
+		t.Fatal("Auth = nil, want non-nil")
+	}
+	if cfg.Auth.Type != "basic" {
+		t.Errorf("Auth.Type = %q, want %q", cfg.Auth.Type, "basic")
+	}
+	if cfg.Auth.Username != "admin" {
+		t.Errorf("Auth.Username = %q, want %q", cfg.Auth.Username, "admin")
+	}
+	if cfg.Auth.Password != "secret" {
+		t.Errorf("Auth.Password = %q, want %q", cfg.Auth.Password, "secret")
+	}
+}
+
+func TestParse_AuthConfig_Bearer_SingleToken(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: bearer
+  token: my-secret-token
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if cfg.Auth == nil {
+		t.Fatal("Auth = nil, want non-nil")
+	}
+	if cfg.Auth.Type != "bearer" {
+		t.Errorf("Auth.Type = %q, want %q", cfg.Auth.Type, "bearer")
+	}
+	if cfg.Auth.Token != "my-secret-token" {
+		t.Errorf("Auth.Token = %q, want %q", cfg.Auth.Token, "my-secret-token")
+	}
+}
+
+func TestParse_AuthConfig_Bearer_MultipleTokens(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: bearer
+  tokens:
+    - token-a
+    - token-b
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if cfg.Auth == nil {
+		t.Fatal("Auth = nil, want non-nil")
+	}
+	if len(cfg.Auth.Tokens) != 2 {
+		t.Fatalf("Auth.Tokens length = %d, want 2", len(cfg.Auth.Tokens))
+	}
+	if cfg.Auth.Tokens[0] != "token-a" {
+		t.Errorf("Auth.Tokens[0] = %q, want %q", cfg.Auth.Tokens[0], "token-a")
+	}
+	if cfg.Auth.Tokens[1] != "token-b" {
+		t.Errorf("Auth.Tokens[1] = %q, want %q", cfg.Auth.Tokens[1], "token-b")
+	}
+}
+
+func TestParse_AuthConfig_EnvVarExpansion(t *testing.T) {
+	t.Setenv("AUTH_USER", "sysadmin")
+	t.Setenv("AUTH_PASS", "p@ssw0rd")
+
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: basic
+  username: ${AUTH_USER}
+  password: ${AUTH_PASS}
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if cfg.Auth.Username != "sysadmin" {
+		t.Errorf("Auth.Username = %q, want %q", cfg.Auth.Username, "sysadmin")
+	}
+	if cfg.Auth.Password != "p@ssw0rd" {
+		t.Errorf("Auth.Password = %q, want %q", cfg.Auth.Password, "p@ssw0rd")
+	}
+}
+
+func TestParse_AuthConfig_ValidationErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		yaml        string
+		wantErrLike string
+	}{
+		{
+			name: "unknown auth type",
+			yaml: `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: apikey
+  token: abc
+`,
+			wantErrLike: "unknown type",
+		},
+		{
+			name: "basic missing username",
+			yaml: `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: basic
+  password: secret
+`,
+			wantErrLike: "non-empty username",
+		},
+		{
+			name: "basic missing password",
+			yaml: `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: basic
+  username: admin
+`,
+			wantErrLike: "non-empty password",
+		},
+		{
+			name: "bearer no tokens",
+			yaml: `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: bearer
+`,
+			wantErrLike: "at least one non-empty token",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.yaml))
+			if err == nil {
+				t.Fatal("Parse() expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErrLike) {
+				t.Errorf("error = %q, want to contain %q", err.Error(), tt.wantErrLike)
+			}
+		})
+	}
+}
+
 func TestParse_Title(t *testing.T) {
 	yaml := `
 title: Video Channel Healthchecks
@@ -1222,5 +1405,256 @@ endpoints:
 	// empty title is valid (defaults to "PulseBoard" at render time)
 	if cfg.Title != "" {
 		t.Errorf("Title = %q, want empty string", cfg.Title)
+	}
+}
+
+// --- TLS config parsing tests ---
+
+// writeTempFile writes content to a temp file in dir and returns its path.
+func writeTempFile(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatalf("writeTempFile: %v", err)
+	}
+	return path
+}
+
+func TestParse_ServerTLS_Valid(t *testing.T) {
+	dir := t.TempDir()
+	certFile := writeTempFile(t, dir, "cert.pem", "placeholder-cert")
+	keyFile := writeTempFile(t, dir, "key.pem", "placeholder-key")
+
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+server:
+  tls:
+    cert_file: ` + certFile + `
+    key_file: ` + keyFile + `
+`
+	_, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Errorf("Parse() unexpected error for valid server TLS: %v", err)
+	}
+}
+
+func TestParse_ServerTLS_CertFileEmpty(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := writeTempFile(t, dir, "key.pem", "placeholder")
+
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+server:
+  tls:
+    cert_file: ""
+    key_file: ` + keyFile + `
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() expected error for empty cert_file, got nil")
+	}
+	if !strings.Contains(err.Error(), "cert_file") {
+		t.Errorf("error = %q, want to contain 'cert_file'", err.Error())
+	}
+}
+
+func TestParse_ServerTLS_CertFileNotExist(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := writeTempFile(t, dir, "key.pem", "placeholder")
+
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+server:
+  tls:
+    cert_file: /nonexistent/cert.pem
+    key_file: ` + keyFile + `
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() expected error for non-existent cert_file, got nil")
+	}
+	if !strings.Contains(err.Error(), "cert_file") {
+		t.Errorf("error = %q, want to contain 'cert_file'", err.Error())
+	}
+}
+
+func TestParse_ClientTLS_Valid(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+client:
+  tls:
+    insecure_skip_verify: true
+    min_version: "1.2"
+`
+	_, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Errorf("Parse() unexpected error for valid client TLS: %v", err)
+	}
+}
+
+func TestParse_ClientTLS_MinVersion13(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+client:
+  tls:
+    min_version: "1.3"
+`
+	_, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Errorf("Parse() unexpected error for min_version 1.3: %v", err)
+	}
+}
+
+func TestParse_ClientTLS_MinVersionInvalid(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+client:
+  tls:
+    min_version: "99"
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() expected error for unknown min_version, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown TLS version") {
+		t.Errorf("error = %q, want to contain 'unknown TLS version'", err.Error())
+	}
+}
+
+func TestParse_ClientTLS_CertWithoutKey(t *testing.T) {
+	dir := t.TempDir()
+	certFile := writeTempFile(t, dir, "cert.pem", "placeholder")
+
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+client:
+  tls:
+    client_cert: ` + certFile + `
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() expected error for client_cert without client_key, got nil")
+	}
+	if !strings.Contains(err.Error(), "must both be set") {
+		t.Errorf("error = %q, want to contain 'must both be set'", err.Error())
+	}
+}
+
+// --- Webhook config parsing tests ---
+
+func TestParseWebhookConfig(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+webhooks:
+  - url: https://hooks.example.com/notify
+    events: [down, degraded]
+    headers:
+      Authorization: Bearer token
+    timeout: 5
+    debounce: 10
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if len(cfg.Webhooks) != 1 {
+		t.Fatalf("len(Webhooks) = %d, want 1", len(cfg.Webhooks))
+	}
+
+	wh := cfg.Webhooks[0]
+	if wh.URL != "https://hooks.example.com/notify" {
+		t.Errorf("Webhooks[0].URL = %q, want %q", wh.URL, "https://hooks.example.com/notify")
+	}
+	if len(wh.Events) != 2 {
+		t.Errorf("len(Webhooks[0].Events) = %d, want 2", len(wh.Events))
+	}
+	if wh.Headers["Authorization"] != "Bearer token" {
+		t.Errorf("Webhooks[0].Headers[Authorization] = %q, want %q", wh.Headers["Authorization"], "Bearer token")
+	}
+	if wh.Timeout != 5 {
+		t.Errorf("Webhooks[0].Timeout = %d, want 5", wh.Timeout)
+	}
+	if wh.Debounce != 10 {
+		t.Errorf("Webhooks[0].Debounce = %d, want 10", wh.Debounce)
+	}
+}
+
+func TestParseWebhookConfig_URLRequired(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+webhooks:
+  - events: [down]
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() expected error for missing webhook URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "url is required") {
+		t.Errorf("error = %q, want to contain 'url is required'", err.Error())
+	}
+}
+
+func TestParseWebhookConfig_HeaderEnvExpansion(t *testing.T) {
+	t.Setenv("WEBHOOK_TOKEN", "secret-webhook-token")
+
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+webhooks:
+  - url: https://hooks.example.com/notify
+    headers:
+      Authorization: "Bearer ${WEBHOOK_TOKEN}"
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if len(cfg.Webhooks) != 1 {
+		t.Fatalf("len(Webhooks) = %d, want 1", len(cfg.Webhooks))
+	}
+
+	got := cfg.Webhooks[0].Headers["Authorization"]
+	want := "Bearer secret-webhook-token"
+	if got != want {
+		t.Errorf("Headers[Authorization] = %q, want %q", got, want)
+	}
+}
+
+func TestParseWebhookConfig_NegativeTimeout(t *testing.T) {
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+webhooks:
+  - url: https://hooks.example.com/notify
+    timeout: -1
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() expected error for negative webhook timeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "timeout must be non-negative") {
+		t.Errorf("error = %q, want to contain 'timeout must be non-negative'", err.Error())
 	}
 }

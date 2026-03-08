@@ -97,16 +97,16 @@ func TestJSONFieldExtractor(t *testing.T) {
 		{"mixed case Healthy", "status", `{"status": "Healthy"}`, StatusUp},
 
 		// missing field
-		{"missing field", "status", `{"other": "value"}`, StatusUnknown},
-		{"missing nested", "data.status", `{"data": {"other": "value"}}`, StatusUnknown},
+		{"missing field", "status", `{"other": "value"}`, StatusError},
+		{"missing nested", "data.status", `{"data": {"other": "value"}}`, StatusError},
 
 		// invalid JSON
-		{"invalid json", "status", `not json`, StatusUnknown},
-		{"empty body", "status", ``, StatusUnknown},
+		{"invalid json", "status", `not json`, StatusError},
+		{"empty body", "status", ``, StatusError},
 
 		// wrong type at path
-		{"array at path", "status", `{"status": ["a", "b"]}`, StatusUnknown},
-		{"object at path", "status", `{"status": {"nested": "value"}}`, StatusUnknown},
+		{"array at path", "status", `{"status": ["a", "b"]}`, StatusError},
+		{"object at path", "status", `{"status": {"nested": "value"}}`, StatusError},
 	}
 
 	for _, tt := range tests {
@@ -137,7 +137,7 @@ func TestRegexExtractor(t *testing.T) {
 		{"case insensitive", `"status":\s*"(\w+)"`, "OK", `{"status": "ok"}`, StatusUp},
 
 		// no capture group match
-		{"no capture match", `"status":\s*"(\w+)"`, "ok", `no status here`, StatusUnknown},
+		{"no capture match", `"status":\s*"(\w+)"`, "ok", `no status here`, StatusError},
 
 		// XML-style
 		{"xml status", `<status>(\w+)</status>`, "healthy", `<status>healthy</status>`, StatusUp},
@@ -275,11 +275,11 @@ func TestDefaultExtractor(t *testing.T) {
 		{"json ok with 500", `{"status": "ok"}`, 500, StatusUp}, // JSON wins
 		{"json down with 200", `{"status": "down"}`, 200, StatusDown},
 
-		// falls back to HTTP status when no JSON status field
-		{"no json, 200", `{"other": "field"}`, 200, StatusUp},
-		{"no json, 500", `{"other": "field"}`, 500, StatusDown},
-		{"invalid json, 200", `not json`, 200, StatusUp},
-		{"invalid json, 503", `not json`, 503, StatusDown},
+		// falls back to HTTP status when no JSON status field (missing field returns StatusError, not StatusUnknown, so HTTPStatusExtractor is NOT consulted)
+		{"no json, 200", `{"other": "field"}`, 200, StatusError},
+		{"no json, 500", `{"other": "field"}`, 500, StatusError},
+		{"invalid json, 200", `not json`, 200, StatusError},
+		{"invalid json, 503", `not json`, 503, StatusError},
 	}
 
 	for _, tt := range tests {

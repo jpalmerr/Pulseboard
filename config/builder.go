@@ -1,13 +1,60 @@
 package config
 
 import (
-	"bytes"
+	"crypto/subtle"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sort"
-	"text/template"
+	"time"
 
 	"github.com/jpalmerr/pulseboard"
+	"github.com/jpalmerr/pulseboard/internal/urltmpl"
 )
+
+// BuildServerTLSOptions returns the SDK options for server TLS configuration.
+// Returns nil slice if no server TLS is configured.
+func BuildServerTLSOptions(cfg *Config) []pulseboard.Option {
+	if cfg.Server == nil || cfg.Server.TLS == nil {
+		return nil
+	}
+	t := cfg.Server.TLS
+	if t.CertFile == "" || t.KeyFile == "" {
+		return nil
+	}
+	return []pulseboard.Option{
+		pulseboard.WithTLS(t.CertFile, t.KeyFile),
+	}
+}
+
+// BuildClientTLSOptions returns the SDK options for client TLS configuration.
+// Returns nil slice if no client TLS is configured.
+func BuildClientTLSOptions(cfg *Config) ([]pulseboard.Option, error) {
+	if cfg.Client == nil || cfg.Client.TLS == nil {
+		return nil, nil
+	}
+	t := cfg.Client.TLS
+	var opts []pulseboard.Option
+
+	if t.InsecureSkipVerify {
+		opts = append(opts, pulseboard.WithInsecureSkipVerify())
+	}
+
+	if t.MinVersion != "" {
+		version, err := parseTLSVersion(t.MinVersion)
+		if err != nil {
+			// already validated during Parse, but be defensive
+			return nil, fmt.Errorf("client.tls.min_version: %w", err)
+		}
+		opts = append(opts, pulseboard.WithTLSMinVersion(version))
+	}
+
+	if t.ClientCert != "" {
+		opts = append(opts, pulseboard.WithClientCert(t.ClientCert, t.ClientKey))
+	}
+
+	return opts, nil
+}
 
 // BuildEndpoints converts parsed configuration into SDK Endpoint objects.
 //
@@ -84,20 +131,19 @@ func mapToKeyValuePairs(m map[string]string) []string {
 
 // buildGridEndpoints expands a GridConfig into multiple endpoints via cartesian product.
 func buildGridEndpoints(gc GridConfig) ([]pulseboard.Endpoint, error) {
-	tmpl, err := template.New("url").Option("missingkey=error").Parse(gc.URLTemplate)
-	if err != nil {
-		return nil, err
+	if err := urltmpl.Validate(gc.URLTemplate, gc.Dimensions); err != nil {
+		return nil, fmt.Errorf("grids[%s]: invalid url_template: %w", gc.Name, err)
 	}
 
 	combinations := cartesianProduct(gc.Dimensions)
 
 	var endpoints []pulseboard.Endpoint
 	for _, combo := range combinations {
-		var buf bytes.Buffer
-		if err := tmpl.Execute(&buf, combo); err != nil {
-			return nil, fmt.Errorf("grid (%s) with dimensions %v: template execution failed: %w", gc.Name, combo, err)
+		encoded := urlEncodeMap(combo)
+		urlStr, err := urltmpl.Expand(gc.URLTemplate, encoded)
+		if err != nil {
+			return nil, fmt.Errorf("grid (%s) with dimensions %v: template expansion failed: %w", gc.Name, combo, err)
 		}
-		url := buf.String()
 		name := buildGridName(gc.Name, combo)
 
 		// grid labels first, dimension values added on top
@@ -111,7 +157,7 @@ func buildGridEndpoints(gc GridConfig) ([]pulseboard.Endpoint, error) {
 
 		ec := EndpointConfig{
 			Name:      name,
-			URL:       url,
+			URL:       urlStr,
 			Method:    gc.Method,
 			Timeout:   gc.Timeout,
 			Headers:   gc.Headers,
@@ -128,6 +174,17 @@ func buildGridEndpoints(gc GridConfig) ([]pulseboard.Endpoint, error) {
 	}
 
 	return endpoints, nil
+}
+
+// urlEncodeMap returns a new map with all values URL-encoded.
+// NOTE: the original buildGridEndpoints did not URL-encode values — this
+// fixes that pre-existing bug. Values like "us east" now produce correct URLs.
+func urlEncodeMap(m map[string]string) map[string]string {
+	result := make(map[string]string, len(m))
+	for k, v := range m {
+		result[k] = url.QueryEscape(v)
+	}
+	return result
 }
 
 // buildGridName creates a display name for a grid endpoint.
@@ -177,6 +234,80 @@ func cartesianProduct(dimensions map[string][]string) []map[string]string {
 	}
 
 	return result
+}
+
+// BuildAuthMiddleware converts an AuthConfig into a middleware function.
+//
+// Returns nil if auth is nil (no authentication configured).
+// Validation is expected to have been run before calling this function —
+// unknown types and missing credentials should be caught at parse time.
+//
+// Username and password comparisons use constant-time equality to prevent
+// timing side-channels.
+func BuildAuthMiddleware(auth *AuthConfig) func(http.Handler) http.Handler {
+	if auth == nil {
+		return nil
+	}
+
+	switch auth.Type {
+	case "basic":
+		wantUser := []byte(auth.Username)
+		wantPass := []byte(auth.Password)
+		return pulseboard.BasicAuth(func(u, p string) bool {
+			userOK := subtle.ConstantTimeCompare([]byte(u), wantUser)
+			passOK := subtle.ConstantTimeCompare([]byte(p), wantPass)
+			return (userOK & passOK) == 1
+		})
+	case "bearer":
+		tokens := auth.Tokens
+		if len(tokens) == 0 && auth.Token != "" {
+			tokens = []string{auth.Token}
+		}
+		return pulseboard.BearerToken(tokens...)
+	default:
+		return nil
+	}
+}
+
+// BuildWebhookOptions returns PulseBoard options for all configured webhooks.
+// Returns nil if no webhooks are configured.
+func BuildWebhookOptions(cfg *Config) []pulseboard.Option {
+	if len(cfg.Webhooks) == 0 {
+		return nil
+	}
+
+	opts := make([]pulseboard.Option, 0, len(cfg.Webhooks))
+	for _, wh := range cfg.Webhooks {
+		var webhookOpts []pulseboard.WebhookOption
+
+		if len(wh.Events) > 0 {
+			webhookOpts = append(webhookOpts, pulseboard.WithWebhookEventFilter(wh.Events...))
+		}
+		if len(wh.Headers) > 0 {
+			webhookOpts = append(webhookOpts, pulseboard.WithWebhookHeaders(wh.Headers))
+		}
+		if wh.Timeout > 0 {
+			webhookOpts = append(webhookOpts,
+				pulseboard.WithWebhookTimeout(time.Duration(wh.Timeout)*time.Second))
+		}
+		if wh.Debounce > 0 {
+			webhookOpts = append(webhookOpts,
+				pulseboard.WithWebhookDebounce(time.Duration(wh.Debounce)*time.Second))
+		}
+
+		notifier := pulseboard.WebhookNotifier(wh.URL, webhookOpts...)
+		opts = append(opts, pulseboard.WithStatusChangeCallback(notifier))
+	}
+	return opts
+}
+
+// BuildMetricsOption returns the WithMetrics option when metrics are enabled.
+// Returns nil if the metrics section is absent or Enabled is false.
+func BuildMetricsOption(cfg *Config) []pulseboard.Option {
+	if cfg.Metrics == nil || !cfg.Metrics.Enabled {
+		return nil
+	}
+	return []pulseboard.Option{pulseboard.WithMetrics()}
 }
 
 // buildExtractor converts ExtractorConfig to a StatusExtractor function.
