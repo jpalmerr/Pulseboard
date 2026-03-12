@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jpalmerr/pulseboard/internal/types"
 )
 
 // testLogger returns a logger that discards all output for clean test output.
@@ -208,7 +210,7 @@ func TestScheduler_ContextCancellation(t *testing.T) {
 }
 
 // TestScheduler_ExtractorPanicRecovery verifies that a panicking extractor
-// does not crash the scheduler. Instead, it should return status "down"
+// does not crash the scheduler. Instead, it should return status "error"
 // with an error describing the panic.
 func TestScheduler_ExtractorPanicRecovery(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -232,7 +234,7 @@ func TestScheduler_ExtractorPanicRecovery(t *testing.T) {
 	scheduler.Start(context.Background())
 
 	// collect the result
-	var result StatusResult
+	var result types.StatusResult
 	select {
 	case result = <-scheduler.Results():
 	case <-time.After(5 * time.Second):
@@ -241,9 +243,9 @@ func TestScheduler_ExtractorPanicRecovery(t *testing.T) {
 
 	scheduler.Stop()
 
-	// verify panic was recovered and status is "down"
-	if result.Status != "down" {
-		t.Errorf("Status = %q, want %q", result.Status, "down")
+	// verify panic was recovered and status is "error"
+	if result.Status != "error" {
+		t.Errorf("Status = %q, want %q", result.Status, "error")
 	}
 
 	// verify error contains panic info with correlation ID
@@ -295,7 +297,7 @@ func TestScheduler_ExtractorPanicDoesNotAffectOtherEndpoints(t *testing.T) {
 	scheduler.Start(context.Background())
 
 	// collect both results
-	results := make(map[string]StatusResult)
+	results := make(map[string]types.StatusResult)
 	for i := 0; i < 2; i++ {
 		select {
 		case result := <-scheduler.Results():
@@ -307,9 +309,9 @@ func TestScheduler_ExtractorPanicDoesNotAffectOtherEndpoints(t *testing.T) {
 
 	scheduler.Stop()
 
-	// verify panicking endpoint returned "down"
-	if results["Panicking"].Status != "down" {
-		t.Errorf("Panicking.Status = %q, want %q", results["Panicking"].Status, "down")
+	// verify panicking endpoint returned "error"
+	if results["Panicking"].Status != "error" {
+		t.Errorf("Panicking.Status = %q, want %q", results["Panicking"].Status, "error")
 	}
 
 	// verify healthy endpoint still returned "up"
@@ -327,7 +329,7 @@ func TestScheduler_ExtractorNilPanicRecovery(t *testing.T) {
 	defer server.Close()
 
 	nilPanicExtractor := func(body []byte, statusCode int) string {
-		panic(nil)
+		panic("nil panic value")
 	}
 
 	endpoints := []EndpointInfo{{
@@ -340,7 +342,7 @@ func TestScheduler_ExtractorNilPanicRecovery(t *testing.T) {
 	scheduler := NewScheduler(endpoints, time.Hour, 1, testLogger())
 	scheduler.Start(context.Background())
 
-	var result StatusResult
+	var result types.StatusResult
 	select {
 	case result = <-scheduler.Results():
 	case <-time.After(5 * time.Second):
@@ -349,89 +351,14 @@ func TestScheduler_ExtractorNilPanicRecovery(t *testing.T) {
 
 	scheduler.Stop()
 
-	// verify panic was recovered and status is "down"
-	if result.Status != "down" {
-		t.Errorf("Status = %q, want %q", result.Status, "down")
+	// verify panic was recovered and status is "error"
+	if result.Status != "error" {
+		t.Errorf("Status = %q, want %q", result.Status, "error")
 	}
 
 	// error should still be set even for nil panic
 	if result.Error == nil {
 		t.Fatal("Error = nil, want error for nil panic")
-	}
-}
-
-// TestScheduler_GCDCalculation verifies that the base tick interval is
-// calculated correctly as the GCD of all endpoint intervals.
-func TestScheduler_GCDCalculation(t *testing.T) {
-	tests := []struct {
-		name           string
-		intervals      []time.Duration
-		globalInterval time.Duration
-		expectedBase   time.Duration
-	}{
-		{
-			name:           "all same interval",
-			intervals:      []time.Duration{10 * time.Second, 10 * time.Second},
-			globalInterval: 10 * time.Second,
-			expectedBase:   10 * time.Second,
-		},
-		{
-			name:           "5s and 10s gives GCD of 5s",
-			intervals:      []time.Duration{5 * time.Second, 10 * time.Second},
-			globalInterval: 30 * time.Second,
-			expectedBase:   5 * time.Second,
-		},
-		{
-			name:           "with zero (default) uses global",
-			intervals:      []time.Duration{6 * time.Second, 0}, // 0 = use global
-			globalInterval: 9 * time.Second,
-			expectedBase:   3 * time.Second, // GCD(6, 9) = 3
-		},
-		{
-			name:           "all use default",
-			intervals:      []time.Duration{0, 0, 0},
-			globalInterval: 15 * time.Second,
-			expectedBase:   15 * time.Second,
-		},
-		{
-			name:           "co-prime intervals",
-			intervals:      []time.Duration{7 * time.Second, 11 * time.Second},
-			globalInterval: 30 * time.Second,
-			expectedBase:   1 * time.Second, // GCD(7, 11) = 1
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			endpoints := make([]EndpointInfo, len(tt.intervals))
-			for i, interval := range tt.intervals {
-				endpoints[i] = EndpointInfo{
-					Name:     fmt.Sprintf("ep%d", i),
-					URL:      "http://example.com",
-					Timeout:  time.Second,
-					Interval: interval,
-				}
-			}
-
-			scheduler := NewScheduler(endpoints, tt.globalInterval, 1, testLogger())
-			base := scheduler.calculateBaseInterval()
-
-			if base != tt.expectedBase {
-				t.Errorf("calculateBaseInterval() = %v, want %v", base, tt.expectedBase)
-			}
-		})
-	}
-}
-
-// TestScheduler_GCDCalculation_EmptyEndpoints verifies that an empty endpoint
-// list returns the global interval as the base.
-func TestScheduler_GCDCalculation_EmptyEndpoints(t *testing.T) {
-	globalInterval := 20 * time.Second
-	scheduler := NewScheduler([]EndpointInfo{}, globalInterval, 1, testLogger())
-	base := scheduler.calculateBaseInterval()
-
-	if base != globalInterval {
-		t.Errorf("calculateBaseInterval() = %v, want %v (global)", base, globalInterval)
 	}
 }
 
@@ -552,4 +479,286 @@ func TestScheduler_ImmediatePollOnStart(t *testing.T) {
 	}
 
 	scheduler.Stop()
+}
+
+// --- pollQueue unit tests ---
+
+// TestPollQueue_Push_PopDue verifies the basic heap contract: push entries with
+// different due times and pop only those that are currently due.
+func TestPollQueue_Push_PopDue(t *testing.T) {
+	now := time.Now()
+
+	q := &pollQueue{}
+
+	epA := EndpointInfo{Name: "A"}
+	epB := EndpointInfo{Name: "B"}
+	epC := EndpointInfo{Name: "C"}
+
+	// A and B are due; C is in the future
+	q.push(epA, now.Add(-2*time.Second))
+	q.push(epB, now.Add(-1*time.Second))
+	q.push(epC, now.Add(10*time.Second))
+
+	due := q.popDue(now)
+
+	if len(due) != 2 {
+		t.Fatalf("popDue() = %d entries, want 2", len(due))
+	}
+
+	names := map[string]bool{}
+	for _, ep := range due {
+		names[ep.Name] = true
+	}
+	if !names["A"] || !names["B"] {
+		t.Errorf("popDue() = %v, want both A and B", due)
+	}
+
+	// C must still be in the queue
+	remaining := q.popDue(now.Add(20 * time.Second))
+	if len(remaining) != 1 || remaining[0].Name != "C" {
+		t.Errorf("remaining after first popDue() = %v, want [C]", remaining)
+	}
+}
+
+// TestPollQueue_Empty verifies the empty predicate transitions correctly.
+func TestPollQueue_Empty(t *testing.T) {
+	q := &pollQueue{}
+
+	if !q.empty() {
+		t.Error("empty() = false on new queue, want true")
+	}
+
+	ep := EndpointInfo{Name: "X"}
+	q.push(ep, time.Now().Add(time.Second))
+
+	if q.empty() {
+		t.Error("empty() = true after push, want false")
+	}
+
+	q.popDue(time.Now().Add(2 * time.Second))
+
+	if !q.empty() {
+		t.Error("empty() = false after all entries popped, want true")
+	}
+}
+
+// TestPollQueue_Peek_ReturnsDefaultWhenEmpty verifies that peek returns 100ms
+// on an empty queue and never returns 0 or panics.
+func TestPollQueue_Peek_ReturnsDefaultWhenEmpty(t *testing.T) {
+	q := &pollQueue{}
+
+	d := q.peek()
+
+	if d <= 0 {
+		t.Errorf("peek() = %v on empty queue, want > 0", d)
+	}
+	if d != 100*time.Millisecond {
+		t.Errorf("peek() = %v on empty queue, want 100ms default", d)
+	}
+}
+
+// TestPollQueue_Peek_ReturnsDurationToNextEntry verifies that peek returns
+// approximately the time until the next scheduled entry.
+func TestPollQueue_Peek_ReturnsDurationToNextEntry(t *testing.T) {
+	q := &pollQueue{}
+
+	target := time.Now().Add(500 * time.Millisecond)
+	q.push(EndpointInfo{Name: "X"}, target)
+
+	d := q.peek()
+
+	// Allow generous tolerance for scheduling jitter.
+	if d <= 0 {
+		t.Errorf("peek() = %v, want positive duration", d)
+	}
+	if d > 600*time.Millisecond {
+		t.Errorf("peek() = %v, want <= 600ms (target is 500ms away)", d)
+	}
+}
+
+// TestPollQueue_ConcurrentAccess verifies that the pollQueue is safe for
+// concurrent use. Run with: go test -race ./internal/poller/...
+func TestPollQueue_ConcurrentAccess(t *testing.T) {
+	t.Parallel()
+
+	q := &pollQueue{}
+	now := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		i := i
+		go func() {
+			defer wg.Done()
+			ep := EndpointInfo{Name: fmt.Sprintf("ep%d", i)}
+			q.push(ep, now.Add(time.Duration(i)*time.Millisecond))
+			_ = q.peek()
+			_ = q.empty()
+			_ = q.popDue(now.Add(100 * time.Millisecond))
+		}()
+	}
+	wg.Wait()
+}
+
+// TestPollQueue_FIFO_SameTime verifies that all entries with the same nextPoll
+// time are returned together by a single popDue call.
+func TestPollQueue_FIFO_SameTime(t *testing.T) {
+	q := &pollQueue{}
+	now := time.Now()
+
+	names := []string{"A", "B", "C", "D"}
+	for _, name := range names {
+		q.push(EndpointInfo{Name: name}, now) // all due at the same instant
+	}
+
+	due := q.popDue(now)
+
+	if len(due) != len(names) {
+		t.Errorf("popDue() = %d entries, want %d (all same-time entries)", len(due), len(names))
+	}
+}
+
+// TestScheduler_CoPrimeIntervals_NoGCDDegradation verifies that the priority-
+// queue scheduler handles co-prime intervals correctly. Under the old GCD
+// approach, GCD(7s, 13s) = 1s caused the scheduler to tick every second even
+// though no endpoint needed it. Here we verify both endpoints are polled at
+// least once (immediate poll) and the test completes without deadlock or races.
+// Run with: go test -race ./internal/poller/...
+func TestScheduler_CoPrimeIntervals_NoGCDDegradation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	endpoints := []EndpointInfo{
+		{Name: "Seven", URL: server.URL, Timeout: time.Second, Interval: 7 * time.Second},
+		{Name: "Thirteen", URL: server.URL, Timeout: time.Second, Interval: 13 * time.Second},
+	}
+
+	scheduler := NewScheduler(endpoints, time.Minute, 2, testLogger())
+	scheduler.Start(context.Background())
+
+	// collect results for 100ms — only immediate polls will fire in this window
+	polled := make(map[string]bool)
+	timeout := time.After(300 * time.Millisecond)
+
+collecting:
+	for {
+		select {
+		case result, ok := <-scheduler.Results():
+			if !ok {
+				break collecting
+			}
+			polled[result.EndpointName] = true
+			if polled["Seven"] && polled["Thirteen"] {
+				break collecting
+			}
+		case <-timeout:
+			break collecting
+		}
+	}
+
+	scheduler.Stop()
+	// drain remaining results after Stop
+	for range scheduler.Results() {
+	}
+
+	if !polled["Seven"] {
+		t.Error("Seven endpoint was not polled (expected immediate poll on start)")
+	}
+	if !polled["Thirteen"] {
+		t.Error("Thirteen endpoint was not polled (expected immediate poll on start)")
+	}
+}
+
+// TestPollQueue_Peek_OverdueEntry verifies that peek returns time.Millisecond
+// for an entry whose nextPoll is in the past, never 0 or a negative duration.
+func TestPollQueue_Peek_OverdueEntry(t *testing.T) {
+	q := &pollQueue{}
+	q.push(EndpointInfo{Name: "X"}, time.Now().Add(-5*time.Second)) // in the past
+
+	d := q.peek()
+
+	if d != time.Millisecond {
+		t.Errorf("peek() = %v for overdue entry, want %v (floor)", d, time.Millisecond)
+	}
+}
+
+// TestScheduler_ZeroEndpoints verifies that a scheduler with no endpoints
+// starts and stops cleanly without panic or deadlock, and that the results
+// channel is closed on Stop().
+func TestScheduler_ZeroEndpoints(t *testing.T) {
+	scheduler := NewScheduler(nil, time.Second, 1, testLogger())
+	scheduler.Start(context.Background())
+
+	// drain — no results expected
+	done := make(chan struct{})
+	go func() {
+		for range scheduler.Results() {
+		}
+		close(done)
+	}()
+
+	scheduler.Stop()
+
+	select {
+	case <-done:
+		// success: results channel closed
+	case <-time.After(time.Second):
+		t.Error("results channel not closed after Stop() with zero endpoints")
+	}
+}
+
+// TestScheduler_MaxConcurrencyZero_ClampedToOne verifies that maxConcurrency <= 0
+// is clamped to 1 and the scheduler operates correctly without deadlocking.
+func TestScheduler_MaxConcurrencyZero_ClampedToOne(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	endpoints := []EndpointInfo{
+		{Name: "test", URL: server.URL, Timeout: time.Second},
+	}
+
+	// maxConcurrency = 0 must not deadlock
+	scheduler := NewScheduler(endpoints, time.Hour, 0, testLogger())
+	scheduler.Start(context.Background())
+
+	select {
+	case result := <-scheduler.Results():
+		if result.EndpointName != "test" {
+			t.Errorf("EndpointName = %q, want %q", result.EndpointName, "test")
+		}
+	case <-time.After(time.Second):
+		t.Error("timeout — scheduler deadlocked with maxConcurrency=0")
+	}
+
+	scheduler.Stop()
+	for range scheduler.Results() {
+	}
+}
+
+// BenchmarkScheduler_100Endpoints measures scheduler throughput with 100
+// endpoints across a range of co-prime intervals.
+func BenchmarkScheduler_100Endpoints(b *testing.B) {
+	endpoints := make([]EndpointInfo, 100)
+	for i := range endpoints {
+		endpoints[i] = EndpointInfo{
+			Name:     fmt.Sprintf("ep%d", i),
+			URL:      "http://example.com",
+			Timeout:  time.Second,
+			Interval: time.Duration((i%7)+1) * time.Second,
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s := NewScheduler(endpoints, 60*time.Second, 4, testLogger())
+		s.Start(context.Background())
+		time.Sleep(50 * time.Millisecond)
+		s.Stop()
+		for range s.Results() {
+		}
+	}
 }

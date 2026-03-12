@@ -662,6 +662,26 @@ func TestNewEndpointGrid_ComposableWithExistingAPI(t *testing.T) {
 	}
 }
 
+func TestNewEndpointGrid_ZeroCombinations(t *testing.T) {
+	// inject a dimension with empty values directly, bypassing WithDimensions validation
+	zeroDims := func(cfg *gridConfig) error {
+		cfg.dimensions = map[string][]string{"env": {}}
+		return nil
+	}
+
+	_, err := NewEndpointGrid("Test",
+		WithURLTemplate("https://api.example.com/health?env={{.env}}"),
+		zeroDims,
+	)
+
+	if err == nil {
+		t.Error("NewEndpointGrid() with zero combinations expected error, got nil")
+	}
+	if err != nil && !strings.Contains(err.Error(), "zero endpoints") {
+		t.Errorf("error should mention 'zero endpoints', got: %v", err)
+	}
+}
+
 func TestNewEndpointGrid_MissingTemplate(t *testing.T) {
 	_, err := NewEndpointGrid("Test",
 		WithDimensions(map[string][]string{
@@ -729,47 +749,53 @@ func TestNewEndpointGrid_OptionError(t *testing.T) {
 // =============================================================================
 
 func TestNewEndpointGrid_TemplateWithConditional(t *testing.T) {
-	endpoints, err := NewEndpointGrid("Test",
+	_, err := NewEndpointGrid("Test",
 		WithURLTemplate(`{{if eq .env "prod"}}https{{else}}http{{end}}://api.example.com/health`),
 		WithDimensions(map[string][]string{
 			"env": {"prod", "staging"},
 		}),
 	)
-	if err != nil {
-		t.Fatalf("NewEndpointGrid() error = %v", err)
+	if err == nil {
+		t.Fatal("NewEndpointGrid() expected error for conditional template syntax, got nil")
 	}
-	if len(endpoints) != 2 {
-		t.Fatalf("expected 2 endpoints, got %d", len(endpoints))
-	}
-
-	// prod should use https
-	if !strings.HasPrefix(endpoints[0].URL(), "https://") {
-		t.Errorf("prod endpoint URL should start with https://, got: %s", endpoints[0].URL())
-	}
-
-	// staging should use http
-	if !strings.HasPrefix(endpoints[1].URL(), "http://") || strings.HasPrefix(endpoints[1].URL(), "https://") {
-		t.Errorf("staging endpoint URL should start with http://, got: %s", endpoints[1].URL())
+	if !strings.Contains(err.Error(), "unsupported template syntax") {
+		t.Errorf("error = %q, want to contain 'unsupported template syntax'", err.Error())
 	}
 }
 
 func TestNewEndpointGrid_DimensionKeyWithDot(t *testing.T) {
-	endpoints, err := NewEndpointGrid("Test",
+	// Dimension keys containing dots cannot be referenced with {{.key}} syntax
+	// since the dot would be ambiguous. Users must rename the dimension key.
+	_, err := NewEndpointGrid("Test",
 		WithURLTemplate(`https://api.example.com/health?key={{index . "my.key"}}`),
 		WithDimensions(map[string][]string{
 			"my.key": {"value"},
 		}),
 	)
+	if err == nil {
+		t.Fatal("NewEndpointGrid() expected error for unsupported template syntax, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported template syntax") {
+		t.Errorf("error = %q, want to contain 'unsupported template syntax'", err.Error())
+	}
+}
+
+func TestNewEndpointGrid_TemplateInjectionAttempt(t *testing.T) {
+	// Dimension value containing template syntax must not be evaluated.
+	endpoints, err := NewEndpointGrid("Test",
+		WithURLTemplate("https://example.com/health?env={{.env}}"),
+		WithDimensions(map[string][]string{
+			"env": {"{{.evil}}"},
+		}),
+	)
 	if err != nil {
-		t.Fatalf("NewEndpointGrid() error = %v", err)
+		t.Fatalf("NewEndpointGrid() unexpected error: %v", err)
 	}
 	if len(endpoints) != 1 {
 		t.Fatalf("expected 1 endpoint, got %d", len(endpoints))
 	}
-
-	// verify URL contains the value
-	if !strings.Contains(endpoints[0].URL(), "key=value") {
-		t.Errorf("URL should contain 'key=value', got: %s", endpoints[0].URL())
+	if strings.Contains(endpoints[0].URL(), "{{") {
+		t.Errorf("URL contains unevaluated template syntax: %s — value was not URL-encoded", endpoints[0].URL())
 	}
 }
 

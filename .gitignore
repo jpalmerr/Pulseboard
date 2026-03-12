@@ -14,6 +14,7 @@
 # Planning and personal
 .planning/
 .claude/
+tickets
 
 # Legacy code
 _legacy/

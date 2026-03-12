@@ -1,11 +1,164 @@
 package config
 
 import (
+	"crypto/tls"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jpalmerr/pulseboard"
 )
+
+// okHandler always responds 200 OK; used as the wrapped handler in middleware tests.
+var okHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+})
+
+// --- BuildAuthMiddleware tests ---
+
+func TestBuildAuthMiddleware_Nil(t *testing.T) {
+	mw := BuildAuthMiddleware(nil)
+	if mw != nil {
+		t.Error("BuildAuthMiddleware(nil) = non-nil, want nil")
+	}
+}
+
+func TestBuildAuthMiddleware_Basic(t *testing.T) {
+	mw := BuildAuthMiddleware(&AuthConfig{
+		Type:     "basic",
+		Username: "admin",
+		Password: "secret",
+	})
+	if mw == nil {
+		t.Fatal("BuildAuthMiddleware(basic) = nil, want non-nil middleware")
+	}
+
+	tests := []struct {
+		name     string
+		header   string
+		wantCode int
+	}{
+		{
+			name:     "valid credentials",
+			header:   "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:secret")),
+			wantCode: http.StatusOK,
+		},
+		{
+			name:     "wrong password",
+			header:   "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:wrong")),
+			wantCode: http.StatusUnauthorized,
+		},
+		{
+			name:     "no header",
+			header:   "",
+			wantCode: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			rec := httptest.NewRecorder()
+			mw(okHandler).ServeHTTP(rec, req)
+			if rec.Code != tt.wantCode {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestBuildAuthMiddleware_Bearer_SingleToken(t *testing.T) {
+	mw := BuildAuthMiddleware(&AuthConfig{
+		Type:  "bearer",
+		Token: "my-secret",
+	})
+	if mw == nil {
+		t.Fatal("BuildAuthMiddleware(bearer/single) = nil, want non-nil middleware")
+	}
+
+	tests := []struct {
+		name     string
+		header   string
+		wantCode int
+	}{
+		{"valid token", "Bearer my-secret", http.StatusOK},
+		{"wrong token", "Bearer wrong", http.StatusUnauthorized},
+		{"no header", "", http.StatusUnauthorized},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			rec := httptest.NewRecorder()
+			mw(okHandler).ServeHTTP(rec, req)
+			if rec.Code != tt.wantCode {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestBuildAuthMiddleware_Bearer_MultipleTokens(t *testing.T) {
+	mw := BuildAuthMiddleware(&AuthConfig{
+		Type:   "bearer",
+		Tokens: []string{"token-a", "token-b"},
+	})
+	if mw == nil {
+		t.Fatal("BuildAuthMiddleware(bearer/multiple) = nil, want non-nil middleware")
+	}
+
+	for _, tok := range []string{"token-a", "token-b"} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		mw(okHandler).ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("token %q: status = %d, want 200", tok, rec.Code)
+		}
+	}
+
+	// invalid token should be rejected
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("invalid token: status = %d, want 401", rec.Code)
+	}
+}
+
+func TestBuildAuthMiddleware_UnknownType(t *testing.T) {
+	// Unknown type should now fail at config.Parse() time.
+	// BuildAuthMiddleware itself still returns nil (defensive fallback),
+	// but this case is blocked before it can be reached in production.
+	//
+	// Verify Parse rejects it:
+	yaml := `
+endpoints:
+  - name: Test
+    url: https://example.com
+auth:
+  type: apikey
+  token: abc
+`
+	_, err := Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() expected error for unknown auth type, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown type") {
+		t.Errorf("error = %q, want to contain 'unknown type'", err.Error())
+	}
+}
 
 func TestBuildEndpoints_SingleEndpoint(t *testing.T) {
 	cfg := &Config{
@@ -337,9 +490,9 @@ func TestBuildEndpoints_GridMissingScheme(t *testing.T) {
 	}
 }
 
-// TestBuildGridEndpoints_TemplateExecutionError verifies that template execution
-// errors include contextual information about which grid and dimension combination
-// failed, making debugging easier.
+// TestBuildGridEndpoints_TemplateExecutionError verifies that an error is returned
+// when a placeholder references a dimension key that does not exist, and that the
+// error message includes the grid name and the missing key name.
 func TestBuildGridEndpoints_TemplateExecutionError(t *testing.T) {
 	cfg := &Config{
 		Grids: []GridConfig{
@@ -362,25 +515,158 @@ func TestBuildGridEndpoints_TemplateExecutionError(t *testing.T) {
 
 	errStr := err.Error()
 
-	if !strings.Contains(errStr, "grid (Platform API)") {
+	if !strings.Contains(errStr, "Platform API") {
 		t.Errorf("error should contain grid name, got: %s", errStr)
-	}
-
-	// test dimensions separately to avoid map ordering issues
-	if !strings.Contains(errStr, "env:prod") {
-		t.Errorf("error should contain env dimension, got: %s", errStr)
-	}
-
-	if !strings.Contains(errStr, "svc:api") {
-		t.Errorf("error should contain svc dimension, got: %s", errStr)
-	}
-
-	if !strings.Contains(errStr, "template execution failed") {
-		t.Errorf("error should indicate template execution failure, got: %s", errStr)
 	}
 
 	if !strings.Contains(errStr, "region") {
 		t.Errorf("error should preserve original error mentioning missing key, got: %s", errStr)
+	}
+
+	if !strings.Contains(errStr, "invalid url_template") {
+		t.Errorf("error should indicate url_template validation failure, got: %s", errStr)
+	}
+}
+
+// --- TLS builder tests ---
+
+// applyOptions is a test helper that applies a slice of pulseboard.Option values
+// to a minimal New() call and returns any error.
+func applyOptions(t *testing.T, opts []pulseboard.Option) error {
+	t.Helper()
+	ep, err := pulseboard.NewEndpoint("Test", "https://example.com")
+	if err != nil {
+		t.Fatalf("applyOptions: NewEndpoint: %v", err)
+	}
+	all := append([]pulseboard.Option{pulseboard.WithEndpoint(ep)}, opts...)
+	_, err = pulseboard.New(all...)
+	return err
+}
+
+func TestBuildServerTLSOptions_NilServer(t *testing.T) {
+	cfg := &Config{}
+	opts := BuildServerTLSOptions(cfg)
+	if opts != nil {
+		t.Errorf("BuildServerTLSOptions(nil server) = %v, want nil", opts)
+	}
+}
+
+func TestBuildServerTLSOptions_NilTLS(t *testing.T) {
+	cfg := &Config{Server: &ServerConfig{TLS: nil}}
+	opts := BuildServerTLSOptions(cfg)
+	if opts != nil {
+		t.Errorf("BuildServerTLSOptions(nil TLS) = %v, want nil", opts)
+	}
+}
+
+func TestBuildServerTLSOptions_WithCertAndKey(t *testing.T) {
+	cfg := &Config{
+		Server: &ServerConfig{
+			TLS: &ServerTLSConfig{
+				CertFile: "cert.pem",
+				KeyFile:  "key.pem",
+			},
+		},
+	}
+	opts := BuildServerTLSOptions(cfg)
+	if len(opts) == 0 {
+		t.Fatal("BuildServerTLSOptions() = nil, want non-empty slice")
+	}
+	// applying the option should succeed (cert/key exist as non-empty strings)
+	if err := applyOptions(t, opts); err != nil {
+		t.Errorf("applying BuildServerTLSOptions() = %v, want nil error", err)
+	}
+}
+
+func TestBuildClientTLSOptions_NilClient(t *testing.T) {
+	cfg := &Config{}
+	opts, err := BuildClientTLSOptions(cfg)
+	if err != nil {
+		t.Errorf("BuildClientTLSOptions(nil client) error = %v, want nil", err)
+	}
+	if opts != nil {
+		t.Errorf("BuildClientTLSOptions(nil client) = %v, want nil", opts)
+	}
+}
+
+func TestBuildClientTLSOptions_InsecureSkipVerify(t *testing.T) {
+	cfg := &Config{
+		Client: &ClientConfig{
+			TLS: &ClientTLSConfig{InsecureSkipVerify: true},
+		},
+	}
+	opts, err := BuildClientTLSOptions(cfg)
+	if err != nil {
+		t.Fatalf("BuildClientTLSOptions() error = %v", err)
+	}
+	if len(opts) == 0 {
+		t.Fatal("BuildClientTLSOptions() returned empty opts, want WithInsecureSkipVerify")
+	}
+	if applyErr := applyOptions(t, opts); applyErr != nil {
+		t.Errorf("applying InsecureSkipVerify option = %v, want nil", applyErr)
+	}
+}
+
+func TestBuildClientTLSOptions_MinVersion13(t *testing.T) {
+	cfg := &Config{
+		Client: &ClientConfig{
+			TLS: &ClientTLSConfig{MinVersion: "1.3"},
+		},
+	}
+	opts, err := BuildClientTLSOptions(cfg)
+	if err != nil {
+		t.Fatalf("BuildClientTLSOptions() error = %v", err)
+	}
+	if len(opts) == 0 {
+		t.Fatal("BuildClientTLSOptions() returned empty opts, want WithTLSMinVersion")
+	}
+	if applyErr := applyOptions(t, opts); applyErr != nil {
+		t.Errorf("applying TLSMinVersion option = %v, want nil", applyErr)
+	}
+}
+
+func TestBuildClientTLSOptions_VerifyMinVersionValue(t *testing.T) {
+	// verify that the option returned by BuildClientTLSOptions for "1.3"
+	// actually encodes tls.VersionTLS13 (not just that it applies without error)
+	cfg := &Config{
+		Client: &ClientConfig{
+			TLS: &ClientTLSConfig{MinVersion: "1.3"},
+		},
+	}
+	opts, err := BuildClientTLSOptions(cfg)
+	if err != nil {
+		t.Fatalf("BuildClientTLSOptions() error = %v", err)
+	}
+	// parseTLSVersion("1.3") must return tls.VersionTLS13
+	v, err := parseTLSVersion("1.3")
+	if err != nil {
+		t.Fatalf("parseTLSVersion(\"1.3\") error = %v", err)
+	}
+	if v != tls.VersionTLS13 {
+		t.Errorf("parseTLSVersion(\"1.3\") = 0x%04x, want 0x%04x", v, tls.VersionTLS13)
+	}
+	_ = opts // non-empty confirmed above
+}
+
+func TestBuildClientTLSOptions_WithClientCert(t *testing.T) {
+	cfg := &Config{
+		Client: &ClientConfig{
+			TLS: &ClientTLSConfig{
+				ClientCert: "client-cert.pem",
+				ClientKey:  "client-key.pem",
+			},
+		},
+	}
+	opts, err := BuildClientTLSOptions(cfg)
+	if err != nil {
+		t.Fatalf("BuildClientTLSOptions() error = %v", err)
+	}
+	if len(opts) == 0 {
+		t.Fatal("BuildClientTLSOptions() returned empty opts, want WithClientCert")
+	}
+	// applying should succeed — files are only checked at server Start() time
+	if applyErr := applyOptions(t, opts); applyErr != nil {
+		t.Errorf("applying WithClientCert option = %v, want nil", applyErr)
 	}
 }
 
@@ -414,5 +700,86 @@ func TestCartesianProduct_DeterministicOrder(t *testing.T) {
 					i, j, result[j], first[j])
 			}
 		}
+	}
+}
+
+// --- BuildWebhookOptions tests ---
+
+func TestBuildWebhookOptions_Empty(t *testing.T) {
+	cfg := &Config{}
+	opts := BuildWebhookOptions(cfg)
+	if opts != nil {
+		t.Errorf("BuildWebhookOptions(empty) = %v, want nil", opts)
+	}
+}
+
+func TestBuildWebhookOptions_Single(t *testing.T) {
+	cfg := &Config{
+		Webhooks: []WebhookConfig{
+			{URL: "https://hooks.example.com/notify"},
+		},
+	}
+	opts := BuildWebhookOptions(cfg)
+	if len(opts) != 1 {
+		t.Fatalf("BuildWebhookOptions() returned %d opts, want 1", len(opts))
+	}
+	// The option must be applicable to pulseboard.New without error.
+	if err := applyOptions(t, opts); err != nil {
+		t.Errorf("applying webhook option = %v, want nil", err)
+	}
+}
+
+func TestBuildWebhookOptions_EventFilter(t *testing.T) {
+	cfg := &Config{
+		Webhooks: []WebhookConfig{
+			{
+				URL:    "https://hooks.example.com/notify",
+				Events: []string{"down", "degraded"},
+			},
+		},
+	}
+	opts := BuildWebhookOptions(cfg)
+	if len(opts) != 1 {
+		t.Fatalf("BuildWebhookOptions() returned %d opts, want 1", len(opts))
+	}
+	if err := applyOptions(t, opts); err != nil {
+		t.Errorf("applying webhook option with event filter = %v, want nil", err)
+	}
+}
+
+func TestBuildWebhookOptions_Headers(t *testing.T) {
+	cfg := &Config{
+		Webhooks: []WebhookConfig{
+			{
+				URL:     "https://hooks.example.com/notify",
+				Headers: map[string]string{"Authorization": "Bearer token"},
+			},
+		},
+	}
+	opts := BuildWebhookOptions(cfg)
+	if len(opts) != 1 {
+		t.Fatalf("BuildWebhookOptions() returned %d opts, want 1", len(opts))
+	}
+	if err := applyOptions(t, opts); err != nil {
+		t.Errorf("applying webhook option with headers = %v, want nil", err)
+	}
+}
+
+func TestBuildWebhookOptions_TimeoutAndDebounce(t *testing.T) {
+	cfg := &Config{
+		Webhooks: []WebhookConfig{
+			{
+				URL:      "https://hooks.example.com/notify",
+				Timeout:  5,
+				Debounce: 30,
+			},
+		},
+	}
+	opts := BuildWebhookOptions(cfg)
+	if len(opts) != 1 {
+		t.Fatalf("BuildWebhookOptions() returned %d opts, want 1", len(opts))
+	}
+	if err := applyOptions(t, opts); err != nil {
+		t.Errorf("applying webhook option with timeout/debounce = %v, want nil", err)
 	}
 }

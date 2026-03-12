@@ -2,16 +2,20 @@ package pulseboard
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/jpalmerr/pulseboard/dashboard"
+	"github.com/jpalmerr/pulseboard/internal/metrics"
 	"github.com/jpalmerr/pulseboard/internal/poller"
 	"github.com/jpalmerr/pulseboard/internal/server"
 	"github.com/jpalmerr/pulseboard/internal/store"
+	"github.com/jpalmerr/pulseboard/internal/types"
 )
 
 const (
@@ -42,13 +46,30 @@ const (
 // The caller controls the lifecycle via the context. Cancel the context to
 // trigger graceful shutdown.
 type PulseBoard struct {
-	title           string
-	endpoints       []Endpoint
-	pollingInterval time.Duration
-	port            int
-	maxConcurrency  int
-	logger          *slog.Logger
-	statusCallbacks []func(StatusResult)
+	title                 string
+	endpoints             []Endpoint
+	pollingInterval       time.Duration
+	port                  int
+	maxConcurrency        int
+	logger                *slog.Logger
+	statusCallbacks       []func(StatusResult)
+	statusChangeCallbacks []func(StatusChange)
+	blockPrivateNetworks  bool
+	allowedHosts          []string
+	middleware            []func(http.Handler) http.Handler
+	staleThreshold        time.Duration
+	staleThresholdSet     bool
+	metricsEnabled        bool
+
+	// Server TLS
+	tlsCertFile string
+	tlsKeyFile  string
+
+	// Client TLS
+	clientTLSInsecure   bool
+	clientTLSMinVersion uint16
+	clientTLSCertFile   string
+	clientTLSKeyFile    string
 }
 
 // New creates a new [PulseBoard] instance with the given options.
@@ -106,13 +127,26 @@ func New(opts ...Option) (*PulseBoard, error) {
 	}
 
 	return &PulseBoard{
-		title:           cfg.title,
-		endpoints:       cfg.endpoints,
-		pollingInterval: cfg.pollingInterval,
-		port:            cfg.port,
-		maxConcurrency:  cfg.maxConcurrency,
-		logger:          logger,
-		statusCallbacks: cfg.statusCallbacks,
+		title:                 cfg.title,
+		endpoints:             cfg.endpoints,
+		pollingInterval:       cfg.pollingInterval,
+		port:                  cfg.port,
+		maxConcurrency:        cfg.maxConcurrency,
+		logger:                logger,
+		statusCallbacks:       cfg.statusCallbacks,
+		statusChangeCallbacks: cfg.statusChangeCallbacks,
+		blockPrivateNetworks:  cfg.blockPrivateNetworks,
+		allowedHosts:          cfg.allowedHosts,
+		middleware:            cfg.middleware,
+		staleThreshold:        cfg.staleThreshold,
+		staleThresholdSet:     cfg.staleThresholdSet,
+		metricsEnabled:        cfg.metricsEnabled,
+		tlsCertFile:           cfg.tlsCertFile,
+		tlsKeyFile:            cfg.tlsKeyFile,
+		clientTLSInsecure:     cfg.clientTLSInsecure,
+		clientTLSMinVersion:   cfg.clientTLSMinVersion,
+		clientTLSCertFile:     cfg.clientTLSCertFile,
+		clientTLSKeyFile:      cfg.clientTLSKeyFile,
 	}, nil
 }
 
@@ -135,9 +169,13 @@ func New(opts ...Option) (*PulseBoard, error) {
 //
 // Returns nil on graceful shutdown. Returns an error if the HTTP server fails to start.
 func (pb *PulseBoard) Start(ctx context.Context) error {
+	scheme := "http"
+	if pb.tlsCertFile != "" {
+		scheme = "https"
+	}
 	pb.logger.Info("pulseboard starting", "endpoint_count", len(pb.endpoints))
 	pb.logger.Info("polling configured", "interval", pb.pollingInterval.String())
-	pb.logger.Info("dashboard available", "url", fmt.Sprintf("http://localhost:%d", pb.port))
+	pb.logger.Info("dashboard available", "url", fmt.Sprintf("%s://localhost:%d", scheme, pb.port))
 
 	if ctx.Err() != nil {
 		return nil
@@ -145,24 +183,127 @@ func (pb *PulseBoard) Start(ctx context.Context) error {
 
 	pollerEndpoints := pb.toPollerEndpoints()
 	statusStore := store.NewMemoryStore()
-	scheduler := poller.NewScheduler(pollerEndpoints, pb.pollingInterval, pb.maxConcurrency, pb.logger)
+
+	var clientOpts []poller.ClientOption
+	if pb.blockPrivateNetworks {
+		clientOpts = append(clientOpts, poller.WithBlockedCIDRs())
+	}
+	if len(pb.allowedHosts) > 0 {
+		clientOpts = append(clientOpts, poller.WithClientAllowedHosts(pb.allowedHosts...))
+	}
+	if pb.clientTLSInsecure || pb.clientTLSMinVersion != 0 || pb.clientTLSCertFile != "" {
+		tlsCfg, err := buildClientTLSConfig(pb.clientTLSInsecure, pb.clientTLSMinVersion, pb.clientTLSCertFile, pb.clientTLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("failed to build client TLS config: %w", err)
+		}
+		clientOpts = append(clientOpts, poller.WithTLSConfig(tlsCfg))
+	}
+
+	scheduler := poller.NewScheduler(pollerEndpoints, pb.pollingInterval, pb.maxConcurrency, pb.logger, clientOpts...)
 	scheduler.Start(ctx)
+
+	var metricsCollector *metrics.Collector
+	if pb.metricsEnabled {
+		names := make([]string, len(pb.endpoints))
+		for i, ep := range pb.endpoints {
+			names[i] = ep.name
+		}
+		metricsCollector = metrics.NewCollector(names, nil)
+	}
+
+	// determine effective staleness threshold
+	var staleCheckerEnabled bool
+	var staleThreshold time.Duration
+	switch {
+	case pb.staleThresholdSet && pb.staleThreshold == 0:
+		// explicitly disabled: WithStaleThreshold(0) was called
+		staleCheckerEnabled = false
+	case !pb.staleThresholdSet:
+		// not configured: use default of 3x polling interval
+		staleThreshold = 3 * pb.pollingInterval
+		staleCheckerEnabled = true
+	default:
+		// explicitly set to a positive value
+		staleThreshold = pb.staleThreshold
+		staleCheckerEnabled = true
+	}
 
 	// track the results consumer goroutine to ensure clean shutdown
 	var wg sync.WaitGroup
+
+	if staleCheckerEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(pb.pollingInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					count := statusStore.MarkStale(staleThreshold)
+					if count > 0 {
+						pb.logger.Warn("marked endpoints stale", "count", count, "threshold", staleThreshold.String())
+					}
+				}
+			}
+		}()
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		previousStatuses := make(map[string]Status)
 		for result := range scheduler.Results() {
+			// clear stale flag — fresh poll results are never stale
+			result.Stale = false
 			// store update first (callbacks fire after data is persisted)
-			storeResult := pollerResultToStoreResult(result)
-			statusStore.Update(storeResult)
+			statusStore.Update(result)
+
+			if metricsCollector != nil {
+				metricsCollector.RecordPoll(
+					result.EndpointName,
+					result.Latency,
+					string(result.Status),
+					result.Error != nil,
+				)
+			}
 
 			if len(pb.statusCallbacks) > 0 {
 				publicResult := pollerResultToPublicResult(result)
 				for _, cb := range pb.statusCallbacks {
 					invokeCallbackSafe(cb, publicResult, pb.logger)
 				}
+			}
+
+			currentStatus := Status(result.Status)
+			prevStatus, existed := previousStatuses[result.EndpointName]
+			previousStatuses[result.EndpointName] = currentStatus
+
+			if len(pb.statusChangeCallbacks) > 0 && (!existed || prevStatus != currentStatus) {
+				change := StatusChange{
+					EndpointName:   result.EndpointName,
+					URL:            result.URL,
+					Labels:         copyMap(result.Labels),
+					PreviousStatus: prevStatus, // "" on first poll
+					CurrentStatus:  currentStatus,
+					LatencyMs:      result.Latency.Milliseconds(),
+					CheckedAt:      result.CheckedAt,
+					Error:          errorString(result.Error),
+				}
+				for _, cb := range pb.statusChangeCallbacks {
+					invokeStatusChangeCallbackSafe(cb, change, pb.logger)
+				}
+			}
+
+			if metricsCollector != nil && (!existed || prevStatus != currentStatus) {
+				metricsCollector.RecordStatusChange(
+					result.EndpointName,
+					string(prevStatus),
+					string(currentStatus),
+				)
 			}
 
 			// log poll results (DEBUG level for success to reduce noise)
@@ -186,7 +327,7 @@ func (pb *PulseBoard) Start(ctx context.Context) error {
 		wg.Wait()        // wait for all results to be processed
 	}
 
-	httpServer := server.NewServer(statusStore, pb.port, dashboard.Assets, pb.title, pb.logger)
+	httpServer := server.NewServer(statusStore, pb.port, dashboard.Assets, pb.title, pb.logger, pb.middleware, pb.tlsCertFile, pb.tlsKeyFile, metricsCollector)
 	if err := httpServer.Start(ctx); err != nil {
 		cleanup()
 		return fmt.Errorf("failed to start HTTP server: %w", err)
@@ -247,38 +388,19 @@ func (pb *PulseBoard) PollingInterval() time.Duration {
 	return pb.pollingInterval
 }
 
-// pollerResultToStoreResult converts a poller result to a store result.
-func pollerResultToStoreResult(pr poller.StatusResult) store.StatusResult {
-	var errStr *string
-	if pr.Error != nil {
-		s := pr.Error.Error()
-		errStr = &s
-	}
-
-	return store.StatusResult{
-		Name:           pr.EndpointName,
-		URL:            pr.URL,
-		Status:         pr.Status,
-		Labels:         pr.Labels,
-		ResponseTimeMs: pr.Latency.Milliseconds(),
-		CheckedAt:      pr.CheckedAt,
-		Error:          errStr,
-	}
-}
-
-// pollerResultToPublicResult converts internal poller result to public API type.
+// pollerResultToPublicResult converts internal result to public API type.
 // Creates defensive copies of mutable fields to prevent data races.
-func pollerResultToPublicResult(pr poller.StatusResult) StatusResult {
+func pollerResultToPublicResult(r types.StatusResult) StatusResult {
 	return StatusResult{
-		EndpointName: pr.EndpointName,
-		URL:          pr.URL,
-		Status:       Status(pr.Status),
-		Labels:       copyMap(pr.Labels),
-		Latency:      pr.Latency,
-		CheckedAt:    pr.CheckedAt,
-		Error:        pr.Error,
-		RawResponse:  copyBytes(pr.RawResponse),
-		StatusCode:   pr.StatusCode,
+		EndpointName: r.EndpointName,
+		URL:          r.URL,
+		Status:       Status(r.Status),
+		Labels:       copyMap(r.Labels),
+		Latency:      r.Latency,
+		CheckedAt:    r.CheckedAt,
+		Error:        r.Error,
+		RawResponse:  copyBytes(r.RawResponse),
+		StatusCode:   r.StatusCode,
 	}
 }
 
@@ -302,4 +424,51 @@ func invokeCallbackSafe(cb func(StatusResult), result StatusResult, logger *slog
 		}
 	}()
 	cb(result)
+}
+
+// invokeStatusChangeCallbackSafe calls a status change callback with panic recovery.
+// Panics are logged but do not propagate.
+func invokeStatusChangeCallbackSafe(cb func(StatusChange), change StatusChange, logger *slog.Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("status change callback panicked",
+				"panic", r,
+				"endpoint", change.EndpointName,
+			)
+		}
+	}()
+	cb(change)
+}
+
+// errorString converts an error to its string representation.
+// Returns "" for nil errors.
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// buildClientTLSConfig constructs a *tls.Config from the polling client TLS settings.
+// Only called when at least one client TLS option is configured.
+func buildClientTLSConfig(insecure bool, minVersion uint16, certFile, keyFile string) (*tls.Config, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify: insecure, //nolint:gosec // explicitly opt-in via WithInsecureSkipVerify
+	}
+
+	if minVersion != 0 {
+		cfg.MinVersion = minVersion
+	} else {
+		cfg.MinVersion = tls.VersionTLS12 // safe default
+	}
+
+	if certFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load client certificate: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+
+	return cfg, nil
 }

@@ -3,17 +3,19 @@ package pulseboard
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
-	"text/template"
+
+	"github.com/jpalmerr/pulseboard/internal/urltmpl"
 )
 
 // NewEndpointGrid creates multiple endpoints from a URL template and dimensions
 // using cartesian product expansion.
 //
-// The URL template uses Go's text/template syntax. Dimension values are URL-encoded
-// before interpolation. Missing template keys cause an error (fail-fast).
+// The URL template uses {{.key}} placeholder syntax. Each {{.key}} is replaced
+// with the URL-encoded value of the corresponding dimension key. Only simple
+// {{.key}} placeholders are supported — Go template conditionals, loops, and
+// functions are not.
 //
 // Each endpoint name includes dimension values in the format:
 // "Base Name (val1/val2)" (values from alphabetically sorted keys).
@@ -53,25 +55,23 @@ func NewEndpointGrid(baseName string, opts ...GridOption) ([]Endpoint, error) {
 		return nil, errors.New("at least one dimension required")
 	}
 
-	// parse template with missingkey=error for fail-fast behaviour
-	tmpl, err := template.New("url").Option("missingkey=error").Parse(cfg.urlTemplate)
-	if err != nil {
+	if err := urltmpl.Validate(cfg.urlTemplate, cfg.dimensions); err != nil {
 		return nil, fmt.Errorf("invalid URL template: %w", err)
 	}
 
 	combinations := cartesianProduct(cfg.dimensions)
 	if len(combinations) == 0 {
-		return nil, nil
+		return nil, errors.New("grid produced zero endpoints: check that all dimensions have non-empty values")
 	}
 
 	endpoints := make([]Endpoint, 0, len(combinations))
 	for _, combo := range combinations {
-		// URL-encode values for template, keep original for labels
+		// URL-encode values for expansion, keep original for labels
 		encoded := urlEncodeMap(combo)
 
-		urlStr, err := executeTemplate(tmpl, encoded)
+		urlStr, err := urltmpl.Expand(cfg.urlTemplate, encoded)
 		if err != nil {
-			return nil, fmt.Errorf("template execution failed: %w", err)
+			return nil, fmt.Errorf("template expansion failed: %w", err)
 		}
 
 		name := formatEndpointName(baseName, combo)
@@ -164,20 +164,7 @@ func cartesianProduct(dims map[string][]string) []map[string]string {
 
 // urlEncodeMap returns a new map with all values URL-encoded.
 func urlEncodeMap(m map[string]string) map[string]string {
-	result := make(map[string]string, len(m))
-	for k, v := range m {
-		result[k] = url.QueryEscape(v)
-	}
-	return result
-}
-
-// executeTemplate renders the template with the given data.
-func executeTemplate(tmpl *template.Template, data map[string]string) (string, error) {
-	var buf strings.Builder
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+	return urltmpl.EncodeMap(m)
 }
 
 // formatEndpointName creates a name in the format "Base (v1/v2)".

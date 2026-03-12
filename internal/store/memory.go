@@ -2,6 +2,9 @@ package store
 
 import (
 	"sync"
+	"time"
+
+	"github.com/jpalmerr/pulseboard/internal/types"
 )
 
 // MemoryStore is an in-memory implementation of [Store].
@@ -15,8 +18,8 @@ import (
 // for that subscriber to prevent blocking the entire system.
 type MemoryStore struct {
 	mu          sync.RWMutex
-	statuses    map[string]StatusResult
-	subscribers map[chan StatusResult]struct{}
+	statuses    map[string]types.StatusResult
+	subscribers map[chan types.StatusResult]struct{}
 	subMu       sync.RWMutex
 }
 
@@ -25,19 +28,19 @@ type MemoryStore struct {
 // The store is immediately ready for use. No cleanup is required when done.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		statuses:    make(map[string]StatusResult),
-		subscribers: make(map[chan StatusResult]struct{}),
+		statuses:    make(map[string]types.StatusResult),
+		subscribers: make(map[chan types.StatusResult]struct{}),
 	}
 }
 
-// Update stores a [StatusResult] and notifies all subscribers.
+// Update stores a [types.StatusResult] and notifies all subscribers.
 //
-// The result is stored using its Name as the key. Subsequent updates with
+// The result is stored using its EndpointName as the key. Subsequent updates with
 // the same name replace the previous value. All subscribers receive the
 // update (unless their buffer is full).
-func (m *MemoryStore) Update(result StatusResult) {
+func (m *MemoryStore) Update(result types.StatusResult) {
 	m.mu.Lock()
-	m.statuses[result.Name] = result
+	m.statuses[result.EndpointName] = result
 	m.mu.Unlock()
 
 	m.notifySubscribers(result)
@@ -47,11 +50,11 @@ func (m *MemoryStore) Update(result StatusResult) {
 //
 // The returned slice is a copy; modifications do not affect the store.
 // Order is not guaranteed.
-func (m *MemoryStore) GetAll() []StatusResult {
+func (m *MemoryStore) GetAll() []types.StatusResult {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	results := make([]StatusResult, 0, len(m.statuses))
+	results := make([]types.StatusResult, 0, len(m.statuses))
 	for _, status := range m.statuses {
 		results = append(results, status)
 	}
@@ -64,8 +67,8 @@ func (m *MemoryStore) GetAll() []StatusResult {
 // (slow consumer), new updates are dropped for this subscriber.
 //
 // Caller must call [MemoryStore.Unsubscribe] when done to prevent resource leaks.
-func (m *MemoryStore) Subscribe() <-chan StatusResult {
-	ch := make(chan StatusResult, 100)
+func (m *MemoryStore) Subscribe() <-chan types.StatusResult {
+	ch := make(chan types.StatusResult, 100)
 
 	m.subMu.Lock()
 	m.subscribers[ch] = struct{}{}
@@ -78,7 +81,7 @@ func (m *MemoryStore) Subscribe() <-chan StatusResult {
 //
 // After calling Unsubscribe, the channel will be closed and no further
 // updates will be sent. Safe to call multiple times or with an unknown channel.
-func (m *MemoryStore) Unsubscribe(ch <-chan StatusResult) {
+func (m *MemoryStore) Unsubscribe(ch <-chan types.StatusResult) {
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 
@@ -96,7 +99,7 @@ func (m *MemoryStore) Unsubscribe(ch <-chan StatusResult) {
 //
 // This is non-blocking: if a subscriber's channel buffer is full, the message
 // is dropped for that subscriber rather than blocking the update path.
-func (m *MemoryStore) notifySubscribers(result StatusResult) {
+func (m *MemoryStore) notifySubscribers(result types.StatusResult) {
 	m.subMu.RLock()
 	defer m.subMu.RUnlock()
 
@@ -107,4 +110,40 @@ func (m *MemoryStore) notifySubscribers(result StatusResult) {
 			// subscriber is slow, drop the message
 		}
 	}
+}
+
+// MarkStale marks entries whose CheckedAt is older than threshold as stale.
+//
+// An entry is considered stale if its CheckedAt is before (now - threshold).
+// Stale entries have their Stale field set to true and subscribers are notified.
+// Already-stale entries are not re-processed — this method is idempotent: calling
+// it repeatedly does not re-notify subscribers for entries already marked stale.
+// If threshold is zero or negative, this is a no-op and returns 0 without acquiring
+// any lock.
+//
+// Returns the number of entries newly marked stale in this call.
+//
+// Safe for concurrent access.
+func (m *MemoryStore) MarkStale(threshold time.Duration) int {
+	if threshold <= 0 {
+		return 0
+	}
+
+	now := time.Now()
+	cutoff := now.Add(-threshold)
+	var staleCount int
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for name, status := range m.statuses {
+		if !status.Stale && status.CheckedAt.Before(cutoff) {
+			status.Stale = true
+			m.statuses[name] = status
+			staleCount++
+			m.notifySubscribers(status)
+		}
+	}
+
+	return staleCount
 }

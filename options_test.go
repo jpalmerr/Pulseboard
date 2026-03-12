@@ -2,6 +2,7 @@ package pulseboard
 
 import (
 	"bytes"
+	"crypto/tls"
 	"log/slog"
 	"strings"
 	"testing"
@@ -386,5 +387,326 @@ func TestWithTitle_DefaultsToEmpty(t *testing.T) {
 	// title should be empty string when not configured
 	if pb.title != "" {
 		t.Errorf("title = %q, want empty string", pb.title)
+	}
+}
+
+func TestWithBlockPrivateNetworks(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	pb, err := New(
+		WithEndpoint(ep),
+		WithBlockPrivateNetworks(),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if !pb.blockPrivateNetworks {
+		t.Error("blockPrivateNetworks = false, want true after WithBlockPrivateNetworks()")
+	}
+}
+
+func TestWithBlockPrivateNetworks_DefaultOff(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	pb, err := New(WithEndpoint(ep))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if pb.blockPrivateNetworks {
+		t.Error("blockPrivateNetworks = true without option, expected false")
+	}
+}
+
+func TestWithAllowedHosts(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	pb, err := New(
+		WithEndpoint(ep),
+		WithAllowedHosts("api.example.com", "status.example.com"),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if len(pb.allowedHosts) != 2 {
+		t.Fatalf("len(allowedHosts) = %d, want 2", len(pb.allowedHosts))
+	}
+	if pb.allowedHosts[0] != "api.example.com" {
+		t.Errorf("allowedHosts[0] = %q, want %q", pb.allowedHosts[0], "api.example.com")
+	}
+	if pb.allowedHosts[1] != "status.example.com" {
+		t.Errorf("allowedHosts[1] = %q, want %q", pb.allowedHosts[1], "status.example.com")
+	}
+}
+
+func TestWithAllowedHosts_DefaultEmpty(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	pb, err := New(WithEndpoint(ep))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if len(pb.allowedHosts) != 0 {
+		t.Errorf("len(allowedHosts) = %d, want 0", len(pb.allowedHosts))
+	}
+}
+
+func TestWithStaleThreshold_negativeDurationReturnsError(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	_, err := New(
+		WithEndpoint(ep),
+		WithStaleThreshold(-1*time.Second),
+	)
+	if err == nil {
+		t.Error("New() expected error for negative stale threshold, got nil")
+	}
+	if err != nil && !strings.Contains(err.Error(), "stale threshold must be non-negative") {
+		t.Errorf("New() error = %v, want error containing 'stale threshold must be non-negative'", err)
+	}
+}
+
+func TestWithStaleThreshold_zeroDurationIsValid(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	pb, err := New(
+		WithEndpoint(ep),
+		WithStaleThreshold(0),
+	)
+	if err != nil {
+		t.Fatalf("New() unexpected error for zero stale threshold: %v", err)
+	}
+	if pb.staleThreshold != 0 {
+		t.Errorf("staleThreshold = %v, want 0", pb.staleThreshold)
+	}
+	if !pb.staleThresholdSet {
+		t.Error("staleThresholdSet = false, want true after WithStaleThreshold(0)")
+	}
+}
+
+func TestWithStaleThreshold_positiveDurationIsValid(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	pb, err := New(
+		WithEndpoint(ep),
+		WithStaleThreshold(2*time.Minute),
+	)
+	if err != nil {
+		t.Fatalf("New() unexpected error for positive stale threshold: %v", err)
+	}
+	if pb.staleThreshold != 2*time.Minute {
+		t.Errorf("staleThreshold = %v, want %v", pb.staleThreshold, 2*time.Minute)
+	}
+	if !pb.staleThresholdSet {
+		t.Error("staleThresholdSet = false, want true after WithStaleThreshold(2 * time.Minute)")
+	}
+}
+
+// --- TLS option tests ---
+
+func TestWithTLS(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	tests := []struct {
+		name    string
+		cert    string
+		key     string
+		wantErr bool
+		errLike string
+	}{
+		{
+			name:    "valid cert and key paths",
+			cert:    "cert.pem",
+			key:     "key.pem",
+			wantErr: false,
+		},
+		{
+			name:    "empty cert file",
+			cert:    "",
+			key:     "key.pem",
+			wantErr: true,
+			errLike: "both cert and key files are required",
+		},
+		{
+			name:    "empty key file",
+			cert:    "cert.pem",
+			key:     "",
+			wantErr: true,
+			errLike: "both cert and key files are required",
+		},
+		{
+			name:    "both empty",
+			cert:    "",
+			key:     "",
+			wantErr: true,
+			errLike: "both cert and key files are required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pb, err := New(
+				WithEndpoint(ep),
+				WithTLS(tt.cert, tt.key),
+			)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("New() expected error, got nil")
+				}
+				if err != nil && tt.errLike != "" && !strings.Contains(err.Error(), tt.errLike) {
+					t.Errorf("New() error = %v, want to contain %q", err, tt.errLike)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New() unexpected error: %v", err)
+			}
+			if pb.tlsCertFile != tt.cert {
+				t.Errorf("tlsCertFile = %q, want %q", pb.tlsCertFile, tt.cert)
+			}
+			if pb.tlsKeyFile != tt.key {
+				t.Errorf("tlsKeyFile = %q, want %q", pb.tlsKeyFile, tt.key)
+			}
+		})
+	}
+}
+
+func TestWithInsecureSkipVerify(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	pb, err := New(
+		WithEndpoint(ep),
+		WithInsecureSkipVerify(),
+	)
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+	if !pb.clientTLSInsecure {
+		t.Error("clientTLSInsecure = false, want true after WithInsecureSkipVerify()")
+	}
+}
+
+func TestWithTLSMinVersion(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	tests := []struct {
+		name    string
+		version uint16
+		wantErr bool
+		errLike string
+	}{
+		{
+			name:    "TLS 1.0",
+			version: tls.VersionTLS10,
+			wantErr: false,
+		},
+		{
+			name:    "TLS 1.1",
+			version: tls.VersionTLS11,
+			wantErr: false,
+		},
+		{
+			name:    "TLS 1.2",
+			version: tls.VersionTLS12,
+			wantErr: false,
+		},
+		{
+			name:    "TLS 1.3",
+			version: tls.VersionTLS13,
+			wantErr: false,
+		},
+		{
+			name:    "unknown version",
+			version: 0x9999,
+			wantErr: true,
+			errLike: "unknown TLS version",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pb, err := New(
+				WithEndpoint(ep),
+				WithTLSMinVersion(tt.version),
+			)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("New() expected error, got nil")
+				}
+				if err != nil && tt.errLike != "" && !strings.Contains(err.Error(), tt.errLike) {
+					t.Errorf("New() error = %v, want to contain %q", err, tt.errLike)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New() unexpected error: %v", err)
+			}
+			if pb.clientTLSMinVersion != tt.version {
+				t.Errorf("clientTLSMinVersion = 0x%04x, want 0x%04x", pb.clientTLSMinVersion, tt.version)
+			}
+		})
+	}
+}
+
+func TestWithClientCert(t *testing.T) {
+	ep, _ := NewEndpoint("Test", "https://example.com")
+
+	tests := []struct {
+		name    string
+		cert    string
+		key     string
+		wantErr bool
+		errLike string
+	}{
+		{
+			name:    "valid cert and key paths",
+			cert:    "cert.pem",
+			key:     "key.pem",
+			wantErr: false,
+		},
+		{
+			name:    "empty cert file",
+			cert:    "",
+			key:     "key.pem",
+			wantErr: true,
+			errLike: "both cert and key files are required",
+		},
+		{
+			name:    "empty key file",
+			cert:    "cert.pem",
+			key:     "",
+			wantErr: true,
+			errLike: "both cert and key files are required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pb, err := New(
+				WithEndpoint(ep),
+				WithClientCert(tt.cert, tt.key),
+			)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("New() expected error, got nil")
+				}
+				if err != nil && tt.errLike != "" && !strings.Contains(err.Error(), tt.errLike) {
+					t.Errorf("New() error = %v, want to contain %q", err, tt.errLike)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New() unexpected error: %v", err)
+			}
+			if pb.clientTLSCertFile != tt.cert {
+				t.Errorf("clientTLSCertFile = %q, want %q", pb.clientTLSCertFile, tt.cert)
+			}
+			if pb.clientTLSKeyFile != tt.key {
+				t.Errorf("clientTLSKeyFile = %q, want %q", pb.clientTLSKeyFile, tt.key)
+			}
+		})
 	}
 }

@@ -104,3 +104,32 @@ func TestRunValidate_MissingFile(t *testing.T) {
 		t.Errorf("error should mention 'failed to read', got: %v", err)
 	}
 }
+
+func TestRunValidate_CartesianProductGrid(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// 2 × 2 grid → 4 generated endpoints; verifies cartesian product counting.
+	configContent := `
+port: 8080
+poll_interval: 10s
+grids:
+  - name: Platform
+    url_template: "https://{{.env}}-{{.svc}}.example.com/health"
+    dimensions:
+      env: [prod, staging]
+      svc: [users, orders]
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	output, err := executeValidateCmd(t, configPath)
+	if err != nil {
+		t.Fatalf("validate command error = %v", err)
+	}
+
+	if !strings.Contains(output, "0 direct + 4 from grids = 4 total") {
+		t.Errorf("expected '0 direct + 4 from grids = 4 total' in output, got: %s", output)
+	}
+}

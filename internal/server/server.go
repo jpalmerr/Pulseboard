@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jpalmerr/pulseboard/internal/metrics"
 	"github.com/jpalmerr/pulseboard/internal/store"
 )
 
@@ -37,12 +38,17 @@ const (
 //
 // The server is designed for graceful shutdown via context cancellation.
 type Server struct {
-	store      store.Store
-	port       int
-	httpServer *http.Server
-	assets     fs.FS
-	title      string
-	logger     *slog.Logger
+	store       store.Store
+	port        int
+	addr        string // actual bound address, set by Start after net.Listen
+	httpServer  *http.Server
+	assets      fs.FS
+	title       string
+	logger      *slog.Logger
+	middleware  []func(http.Handler) http.Handler
+	tlsCertFile string
+	tlsKeyFile  string
+	metrics     *metrics.Collector // nil if metrics disabled
 }
 
 // NewServer creates a new HTTP [Server].
@@ -53,15 +59,23 @@ type Server struct {
 //   - assets: Embedded filesystem containing dashboard assets (may be nil)
 //   - title: Dashboard title (defaults to "PulseBoard" if empty)
 //   - logger: Logger for server events
+//   - middleware: Optional middleware chain applied to all handlers
+//   - tlsCertFile: Path to TLS certificate PEM file (empty disables TLS)
+//   - tlsKeyFile: Path to TLS private key PEM file (empty disables TLS)
+//   - metricsCollector: Prometheus metrics collector (nil disables /metrics route)
 //
 // The server is not started until [Server.Start] is called.
-func NewServer(st store.Store, port int, assets fs.FS, title string, logger *slog.Logger) *Server {
+func NewServer(st store.Store, port int, assets fs.FS, title string, logger *slog.Logger, middleware []func(http.Handler) http.Handler, tlsCertFile, tlsKeyFile string, metricsCollector *metrics.Collector) *Server {
 	return &Server{
-		store:  st,
-		port:   port,
-		assets: assets,
-		title:  title,
-		logger: logger,
+		store:       st,
+		port:        port,
+		assets:      assets,
+		title:       title,
+		logger:      logger,
+		middleware:  middleware,
+		tlsCertFile: tlsCertFile,
+		tlsKeyFile:  tlsKeyFile,
+		metrics:     metricsCollector,
 	}
 }
 
@@ -80,6 +94,9 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.assets != nil {
 		mux.HandleFunc("/", s.handleDashboard)
 	}
+	if s.metrics != nil {
+		mux.HandleFunc("/metrics", s.handleMetrics)
+	}
 
 	// create listener first to verify port availability synchronously
 	addr := fmt.Sprintf(":%d", s.port)
@@ -87,9 +104,16 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to bind to port %d: %w", s.port, err)
 	}
+	s.addr = ln.Addr().String()
+
+	// wrap mux with middleware; first added = outermost wrapper
+	var handler http.Handler = mux
+	for i := len(s.middleware) - 1; i >= 0; i-- {
+		handler = s.middleware[i](handler)
+	}
 
 	s.httpServer = &http.Server{
-		Handler: mux,
+		Handler: handler,
 		// BaseContext derives all request contexts from the server context.
 		// When ctx is cancelled, all request contexts are also cancelled,
 		// enabling graceful shutdown of long-running handlers like SSE.
@@ -98,8 +122,16 @@ func (s *Server) Start(ctx context.Context) error {
 		},
 	}
 
+	tlsEnabled := s.tlsCertFile != "" && s.tlsKeyFile != ""
+
 	go func() {
-		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+		var err error
+		if tlsEnabled {
+			err = s.httpServer.ServeTLS(ln, s.tlsCertFile, s.tlsKeyFile)
+		} else {
+			err = s.httpServer.Serve(ln)
+		}
+		if err != nil && err != http.ErrServerClosed {
 			s.logger.Error("http server error", "error", err)
 		}
 	}()
@@ -114,6 +146,24 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// Addr returns the actual network address the server is listening on (e.g. "[::]:8080").
+// Returns an empty string if Start has not been called successfully.
+func (s *Server) Addr() string {
+	return s.addr
+}
+
+// handleMetrics serves Prometheus text exposition format metrics.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if err := s.metrics.WritePrometheus(w); err != nil {
+		s.logger.Error("failed to write metrics response", "error", err)
+	}
 }
 
 // handleDashboard serves the main dashboard page.

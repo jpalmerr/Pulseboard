@@ -105,6 +105,11 @@
             background: rgba(239, 68, 68, 0.15);
         }
 
+        .summary-item[data-status="error"][aria-pressed="true"] {
+            border-color: #f97316;
+            background: rgba(249, 115, 22, 0.15);
+        }
+
         .clear-indicator {
             display: none;
             margin-left: 0.25rem;
@@ -129,6 +134,7 @@
         .summary-dot.up { background: #22c55e; }
         .summary-dot.degraded { background: #f59e0b; }
         .summary-dot.down { background: #ef4444; }
+        .summary-dot.error { background: #f97316; }
 
         .last-updated {
             display: flex;
@@ -190,6 +196,11 @@
             border-left-width: 6px;
             box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.2);
         }
+        .card.error {
+            border-left-color: #f97316;
+            background: #1e293b;
+            border-left-width: 5px;
+        }
 
         .card.pulse {
             animation: pulse 0.5s ease-out;
@@ -236,6 +247,11 @@
         .status-badge.down {
             background: rgba(239, 68, 68, 0.2);
             color: #ef4444;
+        }
+
+        .status-badge.error {
+            background: rgba(249, 115, 22, 0.2);
+            color: #f97316;
         }
 
         .stale-badge {
@@ -389,6 +405,15 @@
                 <div class="summary-dot down"></div>
                 <span id="downCount">0</span> down<span class="clear-indicator" aria-hidden="true">&times;</span>
             </div>
+            <div class="summary-item"
+                 data-status="error"
+                 role="button"
+                 tabindex="0"
+                 aria-pressed="false"
+                 aria-label="Filter to show only error endpoints">
+                <div class="summary-dot error"></div>
+                <span id="errorCount">0</span> error<span class="clear-indicator" aria-hidden="true">&times;</span>
+            </div>
         </div>
     </header>
 
@@ -406,6 +431,7 @@
         const upCount = document.getElementById('upCount');
         const degradedCount = document.getElementById('degradedCount');
         const downCount = document.getElementById('downCount');
+        const errorCount = document.getElementById('errorCount');
 
         // store current statuses and DOM element references
         // note: endpoints are static (defined at SDK startup), so these maps only grow.
@@ -644,7 +670,7 @@
         function updateCard(status) {
             // clear loading state on first card
             if (isShowingLoadingState) {
-                grid.innerHTML = '';
+                grid.replaceChildren();
                 isShowingLoadingState = false;
             }
 
@@ -665,12 +691,21 @@
         // restore loading state (used when connection lost and statuses cleared)
         function showLoadingState() {
             if (!isShowingLoadingState) {
-                grid.innerHTML = `
-                    <div class="loading">
-                        <div class="loading-spinner"></div>
-                        <p>Waiting for first poll...</p>
-                    </div>
-                `;
+                grid.replaceChildren();
+
+                const loading = document.createElement('div');
+                loading.className = 'loading';
+
+                const spinner = document.createElement('div');
+                spinner.className = 'loading-spinner';
+
+                const text = document.createElement('p');
+                text.textContent = 'Waiting for first poll...';
+
+                loading.appendChild(spinner);
+                loading.appendChild(text);
+                grid.appendChild(loading);
+
                 isShowingLoadingState = true;
                 cardElements.clear();
             }
@@ -678,17 +713,19 @@
 
         // update summary counts
         function updateSummary() {
-            let up = 0, degraded = 0, down = 0;
+            let up = 0, degraded = 0, down = 0, error = 0;
 
             statuses.forEach(status => {
                 if (status.status === 'up') up++;
                 else if (status.status === 'degraded') degraded++;
+                else if (status.status === 'error') error++;
                 else down++;
             });
 
             upCount.textContent = up;
             degradedCount.textContent = degraded;
             downCount.textContent = down;
+            errorCount.textContent = error;
         }
 
         // update the global "last updated" display in the header
@@ -764,11 +801,23 @@
                     emptyState.className = 'empty-state';
                     emptyState.setAttribute('role', 'status');
                     emptyState.setAttribute('aria-live', 'polite');
-                    emptyState.innerHTML = `
-                        <div class="empty-state-icon" aria-hidden="true">&#x1F50D;</div>
-                        <p class="empty-state-message">No endpoints with status "${activeFilter}"</p>
-                        <p class="empty-state-hint">Click the filter again to show all endpoints</p>
-                    `;
+
+                    const icon = document.createElement('div');
+                    icon.className = 'empty-state-icon';
+                    icon.setAttribute('aria-hidden', 'true');
+                    icon.textContent = '\uD83D\uDD0D';
+
+                    const message = document.createElement('p');
+                    message.className = 'empty-state-message';
+                    message.textContent = `No endpoints with status "${activeFilter}"`;
+
+                    const hint = document.createElement('p');
+                    hint.className = 'empty-state-hint';
+                    hint.textContent = 'Click the filter again to show all endpoints';
+
+                    emptyState.appendChild(icon);
+                    emptyState.appendChild(message);
+                    emptyState.appendChild(hint);
                     grid.appendChild(emptyState);
                 }
             } else if (existingEmpty) {

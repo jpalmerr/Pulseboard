@@ -1,20 +1,40 @@
 package pulseboard
 
 import (
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 )
 
 // pbConfig holds mutable state during PulseBoard construction.
 type pbConfig struct {
-	title           string
-	endpoints       []Endpoint
-	pollingInterval time.Duration
-	port            int
-	maxConcurrency  int
-	logger          *slog.Logger
-	statusCallbacks []func(StatusResult)
+	title                 string
+	endpoints             []Endpoint
+	pollingInterval       time.Duration
+	port                  int
+	maxConcurrency        int
+	logger                *slog.Logger
+	statusCallbacks       []func(StatusResult)
+	statusChangeCallbacks []func(StatusChange)
+	blockPrivateNetworks  bool
+	allowedHosts          []string
+	middleware            []func(http.Handler) http.Handler
+	staleThreshold        time.Duration
+	staleThresholdSet     bool
+	metricsEnabled        bool
+
+	// Server TLS
+	tlsCertFile string
+	tlsKeyFile  string
+
+	// Client TLS
+	clientTLSInsecure   bool
+	clientTLSMinVersion uint16
+	clientTLSCertFile   string
+	clientTLSKeyFile    string
 }
 
 // Option is a function that configures a [PulseBoard] instance during construction.
@@ -194,6 +214,24 @@ func WithStatusCallback(cb func(StatusResult)) Option {
 	}
 }
 
+// WithStatusChangeCallback registers a function called only when an endpoint's
+// status transitions from one state to another. The first poll for each endpoint
+// is always considered a transition from an empty (unknown) previous status.
+//
+// Multiple callbacks may be registered; they execute in registration order.
+// Panics within callbacks are recovered and logged; they do not affect polling.
+//
+// Nil callbacks return an error.
+func WithStatusChangeCallback(cb func(StatusChange)) Option {
+	return func(cfg *pbConfig) error {
+		if cb == nil {
+			return errors.New("status change callback must not be nil")
+		}
+		cfg.statusChangeCallbacks = append(cfg.statusChangeCallbacks, cb)
+		return nil
+	}
+}
+
 // WithTitle sets the dashboard title displayed in the browser tab and header.
 //
 // If not specified, defaults to "PulseBoard".
@@ -207,6 +245,205 @@ func WithStatusCallback(cb func(StatusResult)) Option {
 func WithTitle(title string) Option {
 	return func(cfg *pbConfig) error {
 		cfg.title = title
+		return nil
+	}
+}
+
+// WithBlockPrivateNetworks enables SSRF protection by blocking requests to
+// RFC1918 private addresses, loopback, link-local, and cloud metadata CIDRs.
+//
+// Blocked ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8,
+// 169.254.0.0/16 (cloud metadata), ::1/128, fc00::/7, fe80::/10.
+//
+// Both the initial URL and any redirect targets are validated. An endpoint
+// whose hostname resolves to a blocked IP will fail with a clear error.
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithBlockPrivateNetworks(),
+//	)
+func WithBlockPrivateNetworks() Option {
+	return func(cfg *pbConfig) error {
+		cfg.blockPrivateNetworks = true
+		return nil
+	}
+}
+
+// WithAllowedHosts restricts polling to only the listed hostnames.
+//
+// When set, any endpoint whose host is not in the list will fail with an error.
+// This is an allowlist mode: hosts not explicitly listed are blocked regardless
+// of whether they are public or private.
+//
+// Can be combined with [WithBlockPrivateNetworks] for defence-in-depth.
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoints(ep1, ep2),
+//	    pulseboard.WithAllowedHosts("api.example.com", "status.example.com"),
+//	)
+func WithAllowedHosts(hosts ...string) Option {
+	return func(cfg *pbConfig) error {
+		cfg.allowedHosts = append(cfg.allowedHosts, hosts...)
+		return nil
+	}
+}
+
+// WithMiddleware adds an HTTP middleware to the dashboard server.
+//
+// Middleware wraps all handlers (dashboard, API, SSE). Multiple middleware
+// functions may be registered by calling WithMiddleware multiple times.
+// The first middleware added becomes the outermost wrapper.
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithMiddleware(pulseboard.BasicAuth(func(u, p string) bool {
+//	        return u == "admin" && p == "secret"
+//	    })),
+//	)
+//
+// Returns an error if the middleware is nil.
+func WithMiddleware(mw func(http.Handler) http.Handler) Option {
+	return func(cfg *pbConfig) error {
+		if mw == nil {
+			return errors.New("middleware cannot be nil")
+		}
+		cfg.middleware = append(cfg.middleware, mw)
+		return nil
+	}
+}
+
+// WithTLS enables HTTPS for the dashboard server.
+// Both certFile and keyFile must be non-empty.
+// Files are validated at server start time (not at option-apply time).
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithTLS("/path/to/cert.pem", "/path/to/key.pem"),
+//	)
+func WithTLS(certFile, keyFile string) Option {
+	return func(cfg *pbConfig) error {
+		if certFile == "" || keyFile == "" {
+			return errors.New("both cert and key files are required for TLS")
+		}
+		cfg.tlsCertFile = certFile
+		cfg.tlsKeyFile = keyFile
+		return nil
+	}
+}
+
+// WithInsecureSkipVerify disables TLS certificate verification for polled endpoints.
+// WARNING: Vulnerable to man-in-the-middle attacks. Only use in development or
+// for internal services with self-signed certificates.
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithInsecureSkipVerify(),
+//	)
+func WithInsecureSkipVerify() Option {
+	return func(cfg *pbConfig) error {
+		cfg.clientTLSInsecure = true
+		return nil
+	}
+}
+
+// WithTLSMinVersion sets the minimum TLS version for polling connections.
+// Use crypto/tls.VersionTLS12 or crypto/tls.VersionTLS13.
+// Default when any client TLS option is active: TLS 1.2.
+//
+// Returns an error if version is not a recognised TLS version constant.
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithTLSMinVersion(tls.VersionTLS13),
+//	)
+func WithTLSMinVersion(version uint16) Option {
+	return func(cfg *pbConfig) error {
+		switch version {
+		case tls.VersionTLS10, tls.VersionTLS11, tls.VersionTLS12, tls.VersionTLS13:
+			cfg.clientTLSMinVersion = version
+			return nil
+		default:
+			return fmt.Errorf("unknown TLS version 0x%04x", version)
+		}
+	}
+}
+
+// WithClientCert sets a client certificate for mutual TLS when polling endpoints.
+// Both certFile and keyFile must be non-empty.
+// The certificate pair is loaded at server start time (not at option-apply time).
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithClientCert("/path/to/client-cert.pem", "/path/to/client-key.pem"),
+//	)
+func WithClientCert(certFile, keyFile string) Option {
+	return func(cfg *pbConfig) error {
+		if certFile == "" || keyFile == "" {
+			return errors.New("both cert and key files are required for client TLS")
+		}
+		cfg.clientTLSCertFile = certFile
+		cfg.clientTLSKeyFile = keyFile
+		return nil
+	}
+}
+
+// WithMetrics enables the /metrics endpoint with Prometheus-compatible metrics.
+//
+// The endpoint serves Prometheus text exposition format at /metrics.
+// Disabled by default — no /metrics route is registered without this option.
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithMetrics(),
+//	)
+func WithMetrics() Option {
+	return func(cfg *pbConfig) error {
+		cfg.metricsEnabled = true
+		return nil
+	}
+}
+
+// WithStaleThreshold sets the duration after which an endpoint with no updates
+// is considered stale. The default is 3x the polling interval.
+//
+// Pass 0 to disable staleness detection entirely — no checker goroutine will run
+// and entries will never be marked stale regardless of how long since their last update.
+//
+// When not called at all, the default threshold of 3x the polling interval applies.
+// For example, with the default polling interval of 15 seconds, the default threshold
+// is 45 seconds: any endpoint not updated within 45 seconds will be marked stale.
+//
+// Example:
+//
+//	pb, err := pulseboard.New(
+//	    pulseboard.WithEndpoint(ep),
+//	    pulseboard.WithStaleThreshold(2 * time.Minute),
+//	)
+//
+// Returns an error if the duration is negative (zero is allowed to disable the feature).
+func WithStaleThreshold(d time.Duration) Option {
+	return func(cfg *pbConfig) error {
+		if d < 0 {
+			return errors.New("stale threshold must be non-negative")
+		}
+		cfg.staleThreshold = d
+		cfg.staleThresholdSet = true
 		return nil
 	}
 }

@@ -37,7 +37,7 @@ var HTTPStatusExtractor StatusExtractor = func(body []byte, statusCode int) Stat
 //   - [StatusUp]: "ok", "healthy", "up", "active", "running", "pass", "passed", "true", "green", "none", "operational"
 //   - [StatusDegraded]: "degraded", "warning", "partial", "yellow", "amber"
 //   - [StatusDown]: any other value
-//   - [StatusUnknown]: if JSON parsing fails or the field doesn't exist
+//   - [StatusError]: if JSON parsing fails or the field doesn't exist
 //
 // Boolean and numeric values are converted: true/1 → "true", false/0 → "false".
 //
@@ -51,12 +51,12 @@ func JSONFieldExtractor(path string) StatusExtractor {
 	return func(body []byte, statusCode int) Status {
 		var data interface{}
 		if err := json.Unmarshal(body, &data); err != nil {
-			return StatusUnknown
+			return StatusError
 		}
 
 		value := extractJSONPath(data, parts)
 		if value == "" {
-			return StatusUnknown
+			return StatusError
 		}
 
 		return mapStringToStatus(strings.ToLower(value))
@@ -119,7 +119,7 @@ func mapStringToStatus(s string) Status {
 // is compared (case-insensitively) against the upMatch string:
 //   - If equal: [StatusUp]
 //   - If not equal: [StatusDown]
-//   - If no match found: [StatusUnknown]
+//   - If no match found: [StatusError]
 //
 // Returns an error if the pattern is invalid.
 //
@@ -136,7 +136,7 @@ func RegexExtractor(pattern string, upMatch string) (StatusExtractor, error) {
 	return func(body []byte, statusCode int) Status {
 		matches := re.FindSubmatch(body)
 		if len(matches) < 2 {
-			return StatusUnknown
+			return StatusError
 		}
 
 		captured := string(matches[1])
