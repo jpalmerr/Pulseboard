@@ -98,6 +98,17 @@ go run ./example
 
 Open http://localhost:8080 to see mock services cycling through status changes.
 
+## Production Deployment
+
+PulseBoard is designed for internal networks and trusted environments. If you plan to expose the dashboard to the public internet, we recommend placing a reverse proxy such as [nginx](https://nginx.org/) or [Caddy](https://caddyserver.com/) in front of PulseBoard to handle:
+
+- **Rate limiting** — PulseBoard does not limit incoming request rates
+- **TLS termination** — centralised certificate management
+- **CORS restrictions** — the SSE endpoint allows all origins by default
+- **Security headers** — CSP, X-Frame-Options, and similar hardening
+
+For internal or VPN-only deployments, no reverse proxy is needed. Enabling [authentication](docs/cli-guide.md) is recommended regardless of environment.
+
 ## Documentation
 
 - **[CLI Guide](docs/cli-guide.md)** - YAML configuration, environment variables, grid endpoints
