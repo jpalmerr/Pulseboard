@@ -14,6 +14,7 @@ A Go library that adds a live status dashboard to your application — no extern
 - **No infrastructure**: Runs inside your application, not as a separate service
 - **Real-time updates**: Built-in Server-Sent Events for live dashboard
 - **Flexible**: Extract status from JSON fields, regex patterns, or HTTP codes
+- **Production-ready**: Built-in auth, TLS, SSRF protection, Prometheus metrics, and webhook alerting
 - **Simple**: Get a dashboard running in minutes
 
 ## Quick Start
@@ -87,6 +88,7 @@ Requires Go 1.23 or later.
 | `GET /` | Dashboard UI |
 | `GET /api/status` | JSON array of current statuses |
 | `GET /api/sse` | Server-Sent Events stream |
+| `GET /metrics` | Prometheus metrics (requires `WithMetrics()` or `metrics.enabled: true`) |
 
 ## Example
 
@@ -100,19 +102,21 @@ Open http://localhost:8080 to see mock services cycling through status changes.
 
 ## Production Deployment
 
-PulseBoard is designed for internal networks and trusted environments. If you plan to expose the dashboard to the public internet, we recommend placing a reverse proxy such as [nginx](https://nginx.org/) or [Caddy](https://caddyserver.com/) in front of PulseBoard to handle:
+PulseBoard includes built-in [authentication](docs/cli-guide.md) (Basic Auth, Bearer Token), [TLS](docs/cli-guide.md), [SSRF protection](docs/cli-guide.md), and [Prometheus metrics](docs/cli-guide.md). For a complete walkthrough, see the [Production Guide](docs/production-guide.md).
+
+For public internet deployments, we recommend also placing a reverse proxy such as [nginx](https://nginx.org/) or [Caddy](https://caddyserver.com/) in front of PulseBoard for:
 
 - **Rate limiting** — PulseBoard does not limit incoming request rates
-- **TLS termination** — centralised certificate management
 - **CORS restrictions** — the SSE endpoint allows all origins by default
 - **Security headers** — CSP, X-Frame-Options, and similar hardening
 
-For internal or VPN-only deployments, no reverse proxy is needed. Enabling [authentication](docs/cli-guide.md) is recommended regardless of environment.
+For internal or VPN-only deployments, enabling authentication is recommended regardless of environment.
 
 ## Documentation
 
 - **[CLI Guide](docs/cli-guide.md)** - YAML configuration, environment variables, grid endpoints
 - **[Library Guide](docs/library-guide.md)** - SDK options, custom extractors, callbacks, integration patterns
+- **[Production Guide](docs/production-guide.md)** - Auth, TLS, SSRF protection, webhooks, Prometheus metrics
 - **[Docker Guide](docs/docker-guide.md)** - Container deployment, Compose, Kubernetes
 - **[API Reference](https://pkg.go.dev/github.com/jpalmerr/pulseboard)** - Full godoc
 

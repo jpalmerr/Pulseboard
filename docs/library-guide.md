@@ -383,7 +383,7 @@ extractor := pulseboard.FirstMatch(
 
 ## Status Callbacks
 
-React to status changes programmatically with the `WithStatusCallback` option.
+React to every poll result with the `WithStatusCallback` option.
 
 ### Basic Callback
 
@@ -406,7 +406,7 @@ The callback receives a `StatusResult` with these fields:
 |-------|------|-------------|
 | `EndpointName` | `string` | Display name of the endpoint |
 | `URL` | `string` | The URL that was polled |
-| `Status` | `Status` | Determined status (Up/Down/Degraded/Unknown) |
+| `Status` | `Status` | Determined status (Up/Down/Degraded/Unknown/Error) |
 | `StatusCode` | `int` | HTTP response status code |
 | `RawResponse` | `[]byte` | Response body (useful for debugging) |
 | `Latency` | `time.Duration` | Request duration |
@@ -502,6 +502,223 @@ Callbacks fire **after** the store update. This means:
 - SSE clients see the update before callbacks complete
 - Callbacks see "official" data matching what's in the store
 - If a callback blocks, it doesn't delay dashboard updates
+
+## Status Change Callbacks
+
+React only to status transitions (not every poll) with `WithStatusChangeCallback`. The first poll for each endpoint is always considered a transition.
+
+### Basic Change Callback
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithStatusChangeCallback(func(change pulseboard.StatusChange) {
+        log.Printf("%s: %s → %s", change.EndpointName, change.PreviousStatus, change.CurrentStatus)
+    }),
+)
+```
+
+### StatusChange Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `EndpointName` | `string` | Display name of the endpoint |
+| `URL` | `string` | The URL that was polled |
+| `Labels` | `map[string]string` | Endpoint metadata |
+| `PreviousStatus` | `Status` | Status before the transition (`""` on first poll) |
+| `CurrentStatus` | `Status` | Status after the transition |
+| `LatencyMs` | `int64` | Request duration in milliseconds |
+| `CheckedAt` | `time.Time` | When the poll occurred |
+| `Error` | `string` | Error message, if any |
+
+### Difference from StatusCallback
+
+- `WithStatusCallback` fires on **every poll**, regardless of whether the status changed.
+- `WithStatusChangeCallback` fires **only when the status transitions** to a different value.
+
+Use `WithStatusCallback` for logging or metrics that need every data point. Use `WithStatusChangeCallback` for alerting, webhooks, or notifications where you only care about transitions.
+
+## Webhook Notifications
+
+Send HTTP POST requests on status transitions using `WebhookNotifier`:
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithStatusChangeCallback(
+        pulseboard.WebhookNotifier("https://hooks.slack.com/services/...",
+            pulseboard.WithWebhookEventFilter("down", "degraded"),
+            pulseboard.WithWebhookDebounce(30 * time.Second),
+            pulseboard.WithWebhookHeaders(map[string]string{
+                "Authorization": "Bearer token",
+            }),
+            pulseboard.WithWebhookTimeout(5 * time.Second),
+        ),
+    ),
+)
+```
+
+`WebhookNotifier` returns a `func(StatusChange)` — it plugs into `WithStatusChangeCallback`. The POST body is the `StatusChange` struct serialised as JSON.
+
+### Webhook Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithWebhookEventFilter(events...)` | all | Only fire for transitions to these statuses |
+| `WithWebhookDebounce(d)` | 0 (off) | Minimum time a status must hold before firing |
+| `WithWebhookHeaders(m)` | none | Custom HTTP headers on every POST |
+| `WithWebhookTimeout(d)` | 10s | HTTP request timeout |
+
+### Multiple Webhooks
+
+Register separate notifiers for different channels:
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    // Slack for all transitions
+    pulseboard.WithStatusChangeCallback(
+        pulseboard.WebhookNotifier("https://hooks.slack.com/services/..."),
+    ),
+    // PagerDuty only for down
+    pulseboard.WithStatusChangeCallback(
+        pulseboard.WebhookNotifier("https://events.pagerduty.com/...",
+            pulseboard.WithWebhookEventFilter("down"),
+            pulseboard.WithWebhookDebounce(60 * time.Second),
+        ),
+    ),
+)
+```
+
+## Authentication Middleware
+
+Protect the dashboard and API with built-in middleware.
+
+### Basic Auth
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithMiddleware(pulseboard.BasicAuth(func(u, p string) bool {
+        return u == "admin" && p == os.Getenv("DASHBOARD_PASSWORD")
+    })),
+)
+```
+
+### Bearer Token
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithMiddleware(pulseboard.BearerToken("my-secret-token")),
+)
+```
+
+Multiple tokens are supported. Token comparison uses constant-time equality to prevent timing side-channels.
+
+### Custom Middleware
+
+`WithMiddleware` accepts any `func(http.Handler) http.Handler`:
+
+```go
+rateLimiter := func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // your rate limiting logic
+        next.ServeHTTP(w, r)
+    })
+}
+
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithMiddleware(rateLimiter),
+    pulseboard.WithMiddleware(pulseboard.BasicAuth(validateFunc)),
+)
+```
+
+Multiple middleware are applied in registration order (first registered = outermost wrapper).
+
+## SSRF Protection
+
+Block requests to private networks and restrict polling to known hosts:
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithBlockPrivateNetworks(),          // blocks RFC1918, loopback, link-local, cloud metadata
+    pulseboard.WithAllowedHosts("api.example.com"), // allowlist mode
+)
+```
+
+- `WithBlockPrivateNetworks` blocks 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, and IPv6 equivalents.
+- `WithAllowedHosts` enables allowlist mode — hosts not explicitly listed are rejected.
+- Both options validate redirect targets, not just initial URLs.
+
+These can be combined for defence-in-depth.
+
+## TLS Support
+
+### Server-Side HTTPS
+
+Serve the dashboard over HTTPS:
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithTLS("/path/to/cert.pem", "/path/to/key.pem"),
+)
+```
+
+### Client-Side TLS for Polling
+
+Configure TLS for connections to polled endpoints:
+
+```go
+// skip certificate verification (dev/internal only)
+pulseboard.WithInsecureSkipVerify()
+
+// set minimum TLS version
+pulseboard.WithTLSMinVersion(tls.VersionTLS13)
+
+// mutual TLS — present a client certificate
+pulseboard.WithClientCert("/path/to/client-cert.pem", "/path/to/client-key.pem")
+```
+
+These options can be combined:
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithTLSMinVersion(tls.VersionTLS12),
+    pulseboard.WithClientCert("/path/to/cert.pem", "/path/to/key.pem"),
+)
+```
+
+## Prometheus Metrics
+
+Expose a `/metrics` endpoint in Prometheus text format:
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithMetrics(),
+)
+```
+
+Records per-endpoint poll latency histograms, status transition counters, and error rates. Disabled by default — no `/metrics` route exists without this option.
+
+## Stale Endpoint Detection
+
+Mark endpoints as stale when no update is received within a threshold:
+
+```go
+pb, err := pulseboard.New(
+    pulseboard.WithEndpoint(api),
+    pulseboard.WithStaleThreshold(2 * time.Minute),
+)
+```
+
+- Default threshold: 3x the polling interval (e.g., 45s with the default 15s interval).
+- Pass `0` to disable staleness detection entirely.
 
 ## Integration Patterns
 
@@ -629,7 +846,10 @@ pulseboard.StatusUp       // service is healthy
 pulseboard.StatusDegraded // service is impaired but functional
 pulseboard.StatusDown     // service is unavailable
 pulseboard.StatusUnknown  // status cannot be determined
+pulseboard.StatusError    // check mechanism failed (extractor panic, parse error)
 ```
+
+`StatusError` is distinct from `StatusDown`: it means the check itself failed (e.g., extractor panic, JSON parse error), not that the service is unreachable.
 
 ### PulseBoard Options
 
@@ -641,7 +861,17 @@ pulseboard.StatusUnknown  // status cannot be determined
 | `WithPort(port)` | 8080 | Dashboard HTTP port |
 | `WithPollingInterval(d)` | 15s | Default polling interval |
 | `WithMaxConcurrency(n)` | 10 | Max concurrent polls |
-| `WithStatusCallback(cb)` | - | Register callback for poll results |
+| `WithStatusCallback(cb)` | - | Register callback for every poll result |
+| `WithStatusChangeCallback(cb)` | - | Register callback for status transitions only |
+| `WithMiddleware(mw)` | - | Add HTTP middleware (auth, rate limiting, etc.) |
+| `WithBlockPrivateNetworks()` | off | Block polling to private/loopback/metadata IPs |
+| `WithAllowedHosts(hosts...)` | - | Restrict polling to listed hostnames only |
+| `WithTLS(cert, key)` | - | Enable HTTPS for the dashboard server |
+| `WithInsecureSkipVerify()` | off | Skip TLS verification when polling (dev only) |
+| `WithTLSMinVersion(v)` | TLS 1.2 | Minimum TLS version for polling connections |
+| `WithClientCert(cert, key)` | - | Client certificate for mTLS polling |
+| `WithMetrics()` | off | Enable Prometheus `/metrics` endpoint |
+| `WithStaleThreshold(d)` | 3x interval | Mark endpoints stale after this duration |
 | `WithLogger(logger)` | slog.Default() | Custom logger |
 
 ### Endpoint Options

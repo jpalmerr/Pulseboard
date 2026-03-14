@@ -51,6 +51,29 @@ title: My Dashboard     # Dashboard title (default: "PulseBoard")
 port: 8080              # HTTP port for dashboard (default: 8080)
 poll_interval: 15s      # Global polling interval (default: 15s)
 
+# SSRF protection — block polling to private networks
+block_private_networks: true
+
+# Dashboard authentication
+auth:
+  type: basic           # "basic" or "bearer"
+  username: admin
+  password: "${DASHBOARD_PASSWORD}"
+
+# Server TLS (HTTPS for the dashboard)
+server:
+  tls:
+    cert_file: /path/to/cert.pem
+    key_file: /path/to/key.pem
+
+# Client TLS (for polling endpoints)
+client:
+  tls:
+    insecure_skip_verify: false       # skip cert verification (dev only)
+    min_version: "1.2"                # "1.0", "1.1", "1.2", or "1.3"
+    client_cert: /path/to/client.pem  # mTLS client certificate
+    client_key: /path/to/client-key.pem
+
 # Direct endpoints
 endpoints:
   - name: My API                    # Display name (required)
@@ -76,6 +99,19 @@ grids:
     extractor:
       type: json
       path: data.health.status
+
+# Webhook notifications on status transitions
+webhooks:
+  - url: "https://hooks.slack.com/services/${SLACK_WEBHOOK}"
+    events: [down, degraded]        # omit for all transitions
+    debounce: 30                    # seconds before firing (prevents flapping)
+    timeout: 5                      # HTTP request timeout in seconds
+    headers:
+      Authorization: "Bearer ${WEBHOOK_TOKEN}"
+
+# Prometheus metrics
+metrics:
+  enabled: true                     # exposes /metrics endpoint
 ```
 
 ## How-To Guides
@@ -307,6 +343,124 @@ endpoints:
 
 This is useful when running multiple dashboards or embedding in internal tools.
 
+### Protect the Dashboard with Authentication
+
+#### Basic Auth
+
+```yaml
+auth:
+  type: basic
+  username: admin
+  password: "${DASHBOARD_PASSWORD}"
+```
+
+Run with:
+```bash
+DASHBOARD_PASSWORD=secret pulseboard serve -c config.yaml
+```
+
+#### Bearer Token
+
+```yaml
+auth:
+  type: bearer
+  token: "${DASHBOARD_TOKEN}"
+```
+
+Multiple tokens are supported:
+
+```yaml
+auth:
+  type: bearer
+  tokens:
+    - "${TOKEN_TEAM_A}"
+    - "${TOKEN_TEAM_B}"
+```
+
+### Set Up Webhook Notifications
+
+Send alerts when endpoints change status:
+
+```yaml
+webhooks:
+  - url: "https://hooks.slack.com/services/${SLACK_WEBHOOK}"
+    events: [down, degraded]
+    debounce: 30
+```
+
+Multiple webhooks can be configured:
+
+```yaml
+webhooks:
+  - url: "https://hooks.slack.com/services/${SLACK_WEBHOOK}"
+    events: [down, degraded]
+    debounce: 30
+
+  - url: "https://events.pagerduty.com/v2/enqueue"
+    events: [down]
+    debounce: 60
+    headers:
+      Authorization: "Bearer ${PAGERDUTY_TOKEN}"
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `url` | (required) | HTTP endpoint to POST status changes to |
+| `events` | all | Status values that trigger the webhook |
+| `debounce` | 0 | Seconds the status must hold before firing |
+| `timeout` | 10 | HTTP request timeout in seconds |
+| `headers` | none | Custom HTTP headers (supports `${VAR}` expansion) |
+
+### Enable SSRF Protection
+
+Block polling to private networks (recommended when endpoint URLs come from untrusted config):
+
+```yaml
+block_private_networks: true
+```
+
+Blocks RFC1918 (10.x, 172.16.x, 192.168.x), loopback (127.x), link-local (169.254.x, cloud metadata), and IPv6 equivalents.
+
+### Enable TLS
+
+#### HTTPS for the Dashboard
+
+```yaml
+server:
+  tls:
+    cert_file: /path/to/cert.pem
+    key_file: /path/to/key.pem
+```
+
+#### Client TLS for Polling
+
+```yaml
+client:
+  tls:
+    min_version: "1.2"
+    client_cert: /path/to/client-cert.pem
+    client_key: /path/to/client-key.pem
+```
+
+For development with self-signed certificates:
+
+```yaml
+client:
+  tls:
+    insecure_skip_verify: true
+```
+
+### Enable Prometheus Metrics
+
+Expose a `/metrics` endpoint in Prometheus text format:
+
+```yaml
+metrics:
+  enabled: true
+```
+
+Records per-endpoint poll latency histograms, status transition counters, and error rates. Scrape at `http://localhost:8080/metrics`.
+
 ## Recognised Status Values
 
 When using JSON extractors, these values are recognised:
@@ -316,6 +470,7 @@ When using JSON extractors, these values are recognised:
 | **Up** | `ok`, `healthy`, `up`, `active`, `running`, `pass`, `passed`, `true`, `green`, `none`, `operational` |
 | **Degraded** | `degraded`, `warning`, `partial`, `yellow`, `amber` |
 | **Down** | Any other value |
+| **Error** | Automatic — assigned when the extractor itself fails (JSON parse error, regex mismatch, panic) |
 
 ## Troubleshooting
 

@@ -37,11 +37,19 @@ func main() {
 	)
 	endpoints = append(endpoints, github)
 
-	// start the dashboard
+	// start the dashboard with v1.1.0 features
 	pb, err := pulseboard.New(
 		pulseboard.WithEndpoints(endpoints...),
 		pulseboard.WithPollingInterval(5*time.Second),
 		pulseboard.WithPort(8080),
+		pulseboard.WithMetrics(),
+		pulseboard.WithStatusChangeCallback(func(change pulseboard.StatusChange) {
+			slog.Info("status changed",
+				"endpoint", change.EndpointName,
+				"from", change.PreviousStatus,
+				"to", change.CurrentStatus,
+			)
+		}),
 	)
 	if err != nil {
 		slog.Error("failed to create pulseboard", "error", err)
@@ -54,10 +62,11 @@ func main() {
 	fmt.Println("  ║   PulseBoard Demo                                     ║")
 	fmt.Println("  ║                                                       ║")
 	fmt.Println("  ║   Open http://localhost:8080 in your browser          ║")
+	fmt.Println("  ║   Metrics at http://localhost:8080/metrics            ║")
 	fmt.Println("  ║                                                       ║")
 	fmt.Println("  ║   Endpoints:                                          ║")
-	fmt.Println("  ║   • 4 mock (2 services × 2 envs via Grid)             ║")
-	fmt.Println("  ║   • 1 external (GitHub, 30s interval)          ║")
+	fmt.Println("  ║   • 4 mock (2 services × 2 envs via Grid)            ║")
+	fmt.Println("  ║   • 1 external (GitHub, 30s interval)                 ║")
 	fmt.Println("  ║                                                       ║")
 	fmt.Println("  ║   Press Ctrl+C to stop                                ║")
 	fmt.Println("  ║                                                       ║")
